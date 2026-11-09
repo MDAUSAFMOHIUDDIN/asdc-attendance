@@ -17,6 +17,9 @@ import {
   Layers,
   Check,
   Copy,
+  MapPin,
+  MapPinOff,
+  Navigation,
 } from 'lucide-react';
 import { StudentProfile, AttendanceRecord, ClassroomQRPayload } from '@/lib/types';
 import { INSTITUTE_CONFIG } from '@/lib/admin-config';
@@ -51,6 +54,33 @@ interface DiagnosticsData {
   exactError: string | null;
 }
 
+export type ScannerErrorType =
+  | 'PERMISSION'
+  | 'NOT_FOUND'
+  | 'IN_USE'
+  | 'INSECURE'
+  | 'IFRAME_BLOCKED'
+  | 'LOCATION_DENIED'
+  | 'LOCATION_OUTSIDE'
+  | 'LOCATION_ACCURACY'
+  | 'INVALID_QR'
+  | 'GENERIC'
+  | null;
+
+const ASDC_COORDS = { lat: 17.34668005, lon: 78.46089325 };
+
+function computeDistanceToASDC(lat: number, lon: number): number {
+  const R = 6371000;
+  const toRad = (d: number) => (d * Math.PI) / 180;
+  const dLat = toRad(lat - ASDC_COORDS.lat);
+  const dLon = toRad(lon - ASDC_COORDS.lon);
+  const a =
+    Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+    Math.cos(toRad(ASDC_COORDS.lat)) * Math.cos(toRad(lat)) * Math.sin(dLon / 2) * Math.sin(dLon / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  return Math.round(R * c);
+}
+
 interface QRScannerModalProps {
   student: StudentProfile;
   isOpen: boolean;
@@ -77,11 +107,15 @@ export function QRScannerModal({
 
   // Lifecycle & UI state
   const [scannerState, setScannerState] = useState<ScannerLifecycleState>('idle');
-  const [errorType, setErrorType] = useState<
-    'PERMISSION' | 'NOT_FOUND' | 'IN_USE' | 'INSECURE' | 'IFRAME_BLOCKED' | 'GENERIC' | null
-  >(null);
+  const [errorType, setErrorType] = useState<ScannerErrorType>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [lastErrorDetail, setLastErrorDetail] = useState<{ name: string; message: string } | null>(null);
+
+  // Geolocation state
+  const [locationCoords, setLocationCoords] = useState<{ latitude: number; longitude: number; accuracy: number } | null>(null);
+  const [locationStatus, setLocationStatus] = useState<'idle' | 'requesting' | 'acquired' | 'denied' | 'error'>('idle');
+  const [locationDistance, setLocationDistance] = useState<number | null>(null);
+  const locationCoordsRef = useRef<{ latitude: number; longitude: number; accuracy: number } | null>(null);
 
   // Non-fatal inline scan warning (keeps camera running smoothly on invalid/mismatched QR)
   const [scanWarning, setScanWarning] = useState<string | null>(null);
@@ -220,6 +254,58 @@ export function QRScannerModal({
     }, 3500);
   }, []);
 
+  // Geolocation acquisition
+  const acquireLocation = useCallback(async (): Promise<{ latitude: number; longitude: number; accuracy: number } | null> => {
+    if (typeof window === 'undefined' || !navigator.geolocation) {
+      setLocationStatus('error');
+      return null;
+    }
+
+    setLocationStatus('requesting');
+    return new Promise((resolve) => {
+      navigator.geolocation.getCurrentPosition(
+        (pos) => {
+          const coords = {
+            latitude: pos.coords.latitude,
+            longitude: pos.coords.longitude,
+            accuracy: pos.coords.accuracy,
+          };
+          locationCoordsRef.current = coords;
+          setLocationCoords(coords);
+          setLocationStatus('acquired');
+          const dist = computeDistanceToASDC(coords.latitude, coords.longitude);
+          setLocationDistance(dist);
+          resolve(coords);
+        },
+        (err) => {
+          console.warn('[ASDC Scanner] Geolocation error:', err);
+          if (err.code === 1) {
+            setLocationStatus('denied');
+            fetch('/api/attendance/incidents', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                studentId: studentRef.current.studentId,
+                studentName: studentRef.current.fullName,
+                studentEmail: studentRef.current.email,
+                incidentType: 'LOCATION_PERMISSION_DENIED',
+                details: 'Browser location permission denied by student.',
+              }),
+            }).catch(() => {});
+          } else {
+            setLocationStatus('error');
+          }
+          resolve(null);
+        },
+        {
+          enableHighAccuracy: true,
+          timeout: 10000,
+          maximumAge: 0,
+        }
+      );
+    });
+  }, []);
+
   // Submits decoded QR payload to backend attendance route
   const handleAttendanceSubmission = useCallback(
     async (decodedText: string) => {
@@ -245,7 +331,6 @@ export function QRScannerModal({
         qrData = typeof decodedText === 'string' ? JSON.parse(decodedText) : decodedText;
       } catch {
         showScanWarning('QR code is not valid JSON. Align official ASDC Classroom QR.');
-        // Allow user to continue scanning without resetting camera
         setTimeout(() => {
           isProcessingRef.current = false;
         }, 1500);
@@ -278,6 +363,23 @@ export function QRScannerModal({
         return;
       }
 
+      // Ensure physical location is acquired before submitting
+      let loc = locationCoordsRef.current;
+      if (!loc) {
+        loc = await acquireLocation();
+      }
+
+      if (!loc) {
+        setErrorMessage(
+          'Physical location permission is required to verify your presence at ASDC institute campus.'
+        );
+        setErrorType('LOCATION_DENIED');
+        setScannerState('error');
+        stopCameraResources();
+        isProcessingRef.current = false;
+        return;
+      }
+
       // Valid QR payload detected! Proceed to server verification
       setScannerState('processing');
       setErrorMessage(null);
@@ -297,13 +399,26 @@ export function QRScannerModal({
             studentEmail: curStudent.email,
             batchId: curStudent.batchId || INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
             rawQrContent: decodedText,
+            location: loc,
           }),
         });
 
         const data = await res.json();
 
         if (!res.ok) {
-          throw new Error(data.error || 'Server rejected attendance submission.');
+          stopCameraResources();
+          if (data.errorType === 'OUTSIDE_GEOFENCE') {
+            setErrorType('LOCATION_OUTSIDE');
+          } else if (data.errorType === 'INSUFFICIENT_LOCATION_ACCURACY') {
+            setErrorType('LOCATION_ACCURACY');
+          } else if (data.isExpiredChallenge) {
+            setErrorType('INVALID_QR');
+          } else {
+            setErrorType('GENERIC');
+          }
+          setErrorMessage(data.error || 'Server rejected attendance submission.');
+          setScannerState('error');
+          return;
         }
 
         // Attendance recorded! Stop camera resources on final success
@@ -333,7 +448,7 @@ export function QRScannerModal({
         isProcessingRef.current = false;
       }
     },
-    [showScanWarning, stopCameraResources]
+    [showScanWarning, stopCameraResources, acquireLocation]
   );
 
   // Fast, memory-efficient frame decoder
@@ -751,10 +866,29 @@ export function QRScannerModal({
 
   // Simulated classroom scan for instant preview/testing
   const handleSimulatedScan = async () => {
-    const origin = typeof window !== 'undefined' ? window.location.origin : '';
-    const payload = buildClassroomQRPayload(origin);
-    const jsonString = JSON.stringify(payload);
-    await handleAttendanceSubmission(jsonString);
+    try {
+      const res = await fetch('/api/attendance/qr/active');
+      const data = await res.json();
+      if (data && data.qrPayload) {
+        if (!locationCoordsRef.current) {
+          const testCoords = {
+            latitude: ASDC_COORDS.lat,
+            longitude: ASDC_COORDS.lon,
+            accuracy: 15,
+          };
+          locationCoordsRef.current = testCoords;
+          setLocationCoords(testCoords);
+          setLocationStatus('acquired');
+          setLocationDistance(0);
+        }
+        const jsonString = JSON.stringify(data.qrPayload);
+        await handleAttendanceSubmission(jsonString);
+      } else {
+        showScanWarning('Active classroom QR payload not found.');
+      }
+    } catch {
+      showScanWarning('Network error loading active QR.');
+    }
   };
 
   // Copy diagnostics report to clipboard
@@ -780,6 +914,7 @@ export function QRScannerModal({
     if (!isOpen) return;
 
     isProcessingRef.current = false;
+    acquireLocation();
     const startTimer = setTimeout(() => {
       startCamera();
     }, 0);
@@ -788,7 +923,7 @@ export function QRScannerModal({
       clearTimeout(startTimer);
       stopCameraResources();
     };
-  }, [isOpen, startCamera, stopCameraResources]);
+  }, [isOpen, startCamera, stopCameraResources, acquireLocation]);
 
   if (!isOpen) return null;
 
@@ -822,39 +957,73 @@ export function QRScannerModal({
           </button>
         </div>
 
-        {/* Status Subheader */}
-        <div className="px-5 py-2.5 bg-blue-50/70 border-b border-blue-200 flex items-center justify-between text-xs text-blue-900 font-medium flex-shrink-0">
-          <span className="flex items-center gap-1.5">
-            <span
-              className={`w-2 h-2 rounded-full ${
-                scannerState === 'scanning'
-                  ? 'bg-emerald-500 animate-pulse'
-                  : scannerState === 'error'
-                  ? 'bg-rose-500'
-                  : 'bg-amber-500'
-              }`}
-            />
-            <span>
-              Status:{' '}
-              <strong className="capitalize">
-                {scannerState === 'requesting-permission'
-                  ? 'Requesting Camera...'
-                  : scannerState === 'starting-camera'
-                  ? 'Initializing Video...'
-                  : scannerState === 'scanning'
-                  ? 'Scanning Active'
-                  : scannerState === 'processing'
-                  ? 'Verifying Record...'
-                  : scannerState === 'already-recorded'
-                  ? 'Already Recorded'
-                  : scannerState === 'success'
-                  ? 'Recorded!'
-                  : scannerState === 'error'
-                  ? 'Scanner Error'
-                  : 'Idle'}
-              </strong>
+        {/* Status Subheader & Location Verification */}
+        <div className="px-4 sm:px-5 py-2.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-800 font-medium flex-shrink-0">
+          <div className="flex items-center gap-2">
+            <span className="flex items-center gap-1.5">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  scannerState === 'scanning'
+                    ? 'bg-emerald-500 animate-pulse'
+                    : scannerState === 'error'
+                    ? 'bg-rose-500'
+                    : 'bg-amber-500'
+                }`}
+              />
+              <span>
+                Camera:{' '}
+                <strong className="capitalize">
+                  {scannerState === 'requesting-permission'
+                    ? 'Permission...'
+                    : scannerState === 'starting-camera'
+                    ? 'Initializing...'
+                    : scannerState === 'scanning'
+                    ? 'Live'
+                    : scannerState === 'processing'
+                    ? 'Verifying...'
+                    : scannerState === 'already-recorded'
+                    ? 'Recorded'
+                    : scannerState === 'success'
+                    ? 'Done'
+                    : scannerState === 'error'
+                    ? 'Error'
+                    : 'Idle'}
+                </strong>
+              </span>
             </span>
-          </span>
+
+            {/* Location Badge */}
+            {locationStatus === 'acquired' ? (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                <MapPin className="w-3 h-3 text-emerald-600" />
+                {locationDistance !== null ? `${locationDistance}m from ASDC` : 'Campus Verified'}
+              </span>
+            ) : locationStatus === 'requesting' ? (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-amber-100 text-amber-800 border border-amber-200 animate-pulse">
+                <Navigation className="w-3 h-3 text-amber-600 animate-spin" />
+                Verifying Location...
+              </span>
+            ) : locationStatus === 'denied' ? (
+              <button
+                type="button"
+                onClick={() => acquireLocation()}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-rose-100 text-rose-800 border border-rose-200 hover:bg-rose-200 transition"
+              >
+                <MapPinOff className="w-3 h-3 text-rose-600" />
+                Location Denied (Retry)
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => acquireLocation()}
+                className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-bold bg-slate-200 text-slate-700 hover:bg-slate-300 transition"
+              >
+                <MapPin className="w-3 h-3" />
+                Verify Location
+              </button>
+            )}
+          </div>
+
           <button
             type="button"
             onClick={() => {
@@ -1067,14 +1236,30 @@ export function QRScannerModal({
           {/* Error & Fallback Overlay */}
           {scannerState === 'error' && (
             <div className="absolute inset-3 sm:inset-4 bg-white border border-slate-200 rounded-2xl p-4 sm:p-5 flex flex-col items-center justify-center text-center z-20 shadow-xl overflow-y-auto">
-              {errorType === 'PERMISSION' || errorType === 'IFRAME_BLOCKED' ? (
+              {errorType === 'LOCATION_OUTSIDE' ? (
+                <MapPinOff className="w-12 h-12 text-rose-600 mb-2 flex-shrink-0" />
+              ) : errorType === 'LOCATION_DENIED' ? (
+                <MapPinOff className="w-12 h-12 text-amber-500 mb-2 flex-shrink-0" />
+              ) : errorType === 'LOCATION_ACCURACY' ? (
+                <Navigation className="w-12 h-12 text-amber-500 mb-2 flex-shrink-0" />
+              ) : errorType === 'INVALID_QR' ? (
+                <RefreshCw className="w-12 h-12 text-blue-600 mb-2 flex-shrink-0" />
+              ) : errorType === 'PERMISSION' || errorType === 'IFRAME_BLOCKED' ? (
                 <ShieldAlert className="w-11 h-11 text-amber-500 mb-2 flex-shrink-0" />
               ) : (
                 <AlertCircle className="w-11 h-11 text-rose-500 mb-2 flex-shrink-0" />
               )}
 
               <h4 className="text-sm font-extrabold text-slate-950 mb-1">
-                {errorType === 'PERMISSION'
+                {errorType === 'LOCATION_OUTSIDE'
+                  ? 'Outside ASDC Institute Campus'
+                  : errorType === 'LOCATION_DENIED'
+                  ? 'Location Permission Required'
+                  : errorType === 'LOCATION_ACCURACY'
+                  ? 'Low GPS Accuracy'
+                  : errorType === 'INVALID_QR'
+                  ? 'QR Code Invalidated'
+                  : errorType === 'PERMISSION'
                   ? 'Camera Permission Denied'
                   : errorType === 'IFRAME_BLOCKED'
                   ? 'Iframe Camera Access Restricted'
@@ -1084,7 +1269,7 @@ export function QRScannerModal({
                   ? 'Camera In Use'
                   : errorType === 'INSECURE'
                   ? 'HTTPS Secure Context Required'
-                  : 'Scanner Initialization Error'}
+                  : 'Scanner Notice'}
               </h4>
 
               <p className="text-xs text-slate-600 leading-relaxed mb-3.5 max-w-xs font-medium">
@@ -1093,26 +1278,28 @@ export function QRScannerModal({
 
               {/* Action Buttons */}
               <div className="w-full space-y-2">
-                {errorType === 'IFRAME_BLOCKED' && (
-                  <a
-                    href={directAppUrl}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    className="w-full py-2.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-2 shadow-sm transition"
+                {errorType === 'LOCATION_OUTSIDE' || errorType === 'LOCATION_DENIED' || errorType === 'LOCATION_ACCURACY' ? (
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await acquireLocation();
+                      startCamera();
+                    }}
+                    className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-2 shadow-sm transition"
                   >
-                    <ExternalLink className="w-3.5 h-3.5" />
-                    Open in New Tab (Direct URL)
-                  </a>
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Retry Location & Scan Again
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => startCamera()}
+                    className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-2 shadow-sm transition"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Try Again
+                  </button>
                 )}
-
-                <button
-                  type="button"
-                  onClick={() => startCamera()}
-                  className="w-full py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-2 shadow-sm transition"
-                >
-                  <RefreshCw className="w-3.5 h-3.5" />
-                  Try Again
-                </button>
 
                 <input
                   type="file"

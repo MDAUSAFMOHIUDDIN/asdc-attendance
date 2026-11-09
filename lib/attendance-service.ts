@@ -359,3 +359,96 @@ export function calculateStudentSummary(
     attendancePercentage,
   };
 }
+
+/**
+ * Fetch Canonical Master Excel Workbook information
+ */
+export async function fetchMasterWorkbookInfo(adminEmail: string): Promise<import('./types').MasterWorkbookInfo> {
+  const res = await fetch(`/api/attendance/master-excel/info?adminEmail=${encodeURIComponent(adminEmail)}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to load master workbook info' }));
+    throw new Error(err.error || 'Failed to load master workbook info');
+  }
+  return res.json();
+}
+
+/**
+ * Fetch detailed daily records from Canonical Master Excel Workbook
+ */
+export async function fetchMasterAttendanceForDate(adminEmail: string, date: string): Promise<{
+  date: string;
+  column: string | null;
+  weekday: string;
+  presentCount: number;
+  absentCount: number;
+  unmarkedCount: number;
+  records: import('./types').DateAttendanceRecord[];
+}> {
+  const res = await fetch(`/api/attendance/master-excel/data?adminEmail=${encodeURIComponent(adminEmail)}&date=${encodeURIComponent(date)}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Failed to load master attendance data' }));
+    throw new Error(err.error || 'Failed to load master attendance data');
+  }
+  return res.json();
+}
+
+/**
+ * Finalize daily attendance in Canonical Master Excel Workbook (Admin action)
+ */
+export async function finalizeMasterDailyAttendance(adminEmail: string, date: string): Promise<{
+  success: boolean;
+  message: string;
+  result: {
+    finalizedCount: number;
+    presentCount: number;
+    absentCount: number;
+    version: number;
+  };
+}> {
+  const res = await fetch('/api/attendance/master-excel/finalize', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ adminEmail, date }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Finalization failed' }));
+    throw new Error(err.error || 'Finalization failed');
+  }
+  return res.json();
+}
+
+/**
+ * Correct an attendance cell in Canonical Master Excel Workbook (Admin action)
+ */
+export async function correctMasterAttendanceEntry(params: {
+  adminEmail: string;
+  row: number;
+  date: string;
+  newStatus: 'P' | 'A' | 'L' | '';
+  reason: string;
+}): Promise<{ success: boolean; message: string; result: any }> {
+  const res = await fetch('/api/attendance/master-excel/correct', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ error: 'Correction failed' }));
+    throw new Error(err.error || 'Correction failed');
+  }
+  return res.json();
+}
+
+/**
+ * Trigger download of the official Master Excel Workbook snapshot
+ */
+export function triggerMasterWorkbookDownload(adminEmail: string): void {
+  const url = `/api/attendance/master-excel/download?adminEmail=${encodeURIComponent(adminEmail)}&t=${Date.now()}`;
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = 'B-19-AI Builder (1) (3).xlsx';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+}
+

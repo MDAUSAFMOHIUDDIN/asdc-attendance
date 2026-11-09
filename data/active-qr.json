@@ -1,0 +1,90 @@
+{
+  "activeChallenge": {
+    "challengeId": "ac1527d8-0a7f-476a-92c2-6545a9e41c84",
+    "status": "ACTIVE",
+    "batchId": "ai-builder-mastery",
+    "issuer": "ASDC",
+    "classroomId": "ASDC_AIMASTERY_ROOM_2026",
+    "generatedAt": "2026-11-09T15:38:06.490Z",
+    "generatedBy": "mdausafmohiuddin@gmail.com",
+    "qrPayload": {
+      "issuer": "ASDC",
+      "type": "classroom_attendance",
+      "batchId": "ai-builder-mastery",
+      "classroomId": "ASDC_AIMASTERY_ROOM_2026",
+      "challengeId": "ac1527d8-0a7f-476a-92c2-6545a9e41c84",
+      "generatedAt": "2026-11-09T15:38:06.490Z"
+    }
+  },
+  "history": [
+    {
+      "challengeId": "ac1527d8-0a7f-476a-92c2-6545a9e41c84",
+      "status": "ACTIVE",
+      "generatedAt": "2026-11-09T15:38:06.490Z",
+      "generatedBy": "mdausafmohiuddin@gmail.com"
+    },
+    {
+      "challengeId": "44b28ed2-9e90-4d89-8714-90b7beba65b3",
+      "status": "INVALIDATED",
+      "generatedAt": "2026-11-09T15:37:40.027Z",
+      "generatedBy": "mdausafmohiuddin@gmail.com",
+      "invalidatedAt": "2026-11-09T15:38:06.490Z"
+    },
+    {
+      "challengeId": "fa62772c-da09-436b-9d32-1e0c820e347c",
+      "status": "INVALIDATED",
+      "generatedAt": "2026-11-09T15:37:22.769Z",
+      "generatedBy": "mdausafmohiuddin@gmail.com",
+      "invalidatedAt": "2026-11-09T15:37:40.027Z"
+    },
+    {
+      "challengeId": "3b3b3618-0a1d-4154-b88d-bfe53e8e9c70",
+      "status": "INVALIDATED",
+      "generatedAt": "2026-11-09T15:36:43.965Z",
+      "generatedBy": "mdausafmohiuddin@gmail.com",
+      "invalidatedAt": "2026-11-09T15:37:22.769Z"
+    },
+    {
+      "challengeId": "f218749c-fb71-46ae-81f0-2ba956612ab2",
+      "status": "INVALIDATED",
+      "generatedAt": "2026-11-09T15:36:06.762Z",
+      "generatedBy": "mdausafmohiuddin@gmail.com",
+      "invalidatedAt": "2026-11-09T15:36:43.965Z"
+    },
+    {
+      "challengeId": "4f4c6b4c-fdbd-4663-8100-ccd099eaa358",
+      "status": "INVALIDATED",
+      "generatedAt": "2026-11-09T15:35:31.031Z",
+      "generatedBy": "mdausafmohiuddin@gmail.com",
+      "invalidatedAt": "2026-11-09T15:36:06.762Z"
+    },
+    {
+      "challengeId": "c4cabc5e-e4bd-4308-a831-944aef8f58b1",
+      "status": "INVALIDATED",
+      "generatedAt": "2026-11-09T15:34:43.664Z",
+      "generatedBy": "mdausafmohiuddin@gmail.com",
+      "invalidatedAt": "2026-11-09T15:35:31.031Z"
+    },
+    {
+      "challengeId": "f128f06a-dcaf-4672-a564-811e7e3a9a50",
+      "status": "INVALIDATED",
+      "generatedAt": "2026-11-09T15:34:22.964Z",
+      "generatedBy": "mdausafmohiuddin@gmail.com",
+      "invalidatedAt": "2026-11-09T15:34:43.664Z"
+    },
+    {
+      "challengeId": "94167608-3706-42b8-b7ef-5b8ed231d4d5",
+      "status": "INVALIDATED",
+      "generatedAt": "2026-11-09T15:33:04.908Z",
+      "generatedBy": "mdausafmohiuddin@gmail.com",
+      "invalidatedAt": "2026-11-09T15:34:22.964Z"
+    },
+    {
+      "challengeId": "73f8434f-60ef-4472-892e-900de50dba0b",
+      "status": "INVALIDATED",
+      "generatedAt": "2026-11-09T15:31:24.767Z",
+      "generatedBy": "mdausafmohiuddin@gmail.com",
+      "invalidatedAt": "2026-11-09T15:33:04.908Z"
+    }
+  ]
+}

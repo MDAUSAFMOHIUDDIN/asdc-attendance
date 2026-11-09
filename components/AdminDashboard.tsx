@@ -21,6 +21,16 @@ import {
   Sliders,
   QrCode,
   CheckCheck,
+  AlertTriangle,
+  AlertCircle,
+  ExternalLink,
+  Info,
+  Check,
+  MapPin,
+  MapPinOff,
+  Navigation,
+  Crosshair,
+  Radio,
 } from 'lucide-react';
 import {
   getAllStudents,
@@ -34,6 +44,11 @@ import {
   createAnnouncement,
   deleteAnnouncement,
   getStudentAttendanceRecords,
+  fetchMasterWorkbookInfo,
+  fetchMasterAttendanceForDate,
+  finalizeMasterDailyAttendance,
+  correctMasterAttendanceEntry,
+  triggerMasterWorkbookDownload,
 } from '@/lib/attendance-service';
 import {
   StudentProfile,
@@ -42,6 +57,12 @@ import {
   Announcement,
   AuditLog,
   AttendanceStatus,
+  MasterWorkbookInfo,
+  DateAttendanceRecord,
+  ExcelStudentRow,
+  ActiveQRChallenge,
+  GeofenceConfig,
+  LocationIncident,
 } from '@/lib/types';
 import {
   getISTTimeInfo,
@@ -61,7 +82,7 @@ interface AdminDashboardProps {
 }
 
 export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
-  const [activeTab, setActiveTab] = useState<'overview' | 'qr' | 'holidays' | 'announcements' | 'audit' | 'settings'>('overview');
+  const [activeTab, setActiveTab] = useState<'overview' | 'excel' | 'qr' | 'holidays' | 'announcements' | 'audit' | 'settings'>('overview');
 
   // Core Data
   const [students, setStudents] = useState<StudentProfile[]>([]);
@@ -69,6 +90,32 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // Master Excel Canonical Workbook State
+  const [masterInfo, setMasterInfo] = useState<MasterWorkbookInfo | null>(null);
+  const [masterDailyData, setMasterDailyData] = useState<{
+    date: string;
+    column: string | null;
+    weekday: string;
+    presentCount: number;
+    absentCount: number;
+    unmarkedCount: number;
+    records: DateAttendanceRecord[];
+  } | null>(null);
+  const [loadingMaster, setLoadingMaster] = useState(false);
+  const [finalizingModalOpen, setFinalizingModalOpen] = useState(false);
+  const [finalizingSubmitting, setFinalizingSubmitting] = useState(false);
+  const [masterCorrectionModal, setMasterCorrectionModal] = useState<{
+    row: number;
+    studentName: string;
+    currentStatus: 'P' | 'A' | 'L' | null;
+    date: string;
+    cellRef: string;
+  } | null>(null);
+  const [masterCorrectionStatus, setMasterCorrectionStatus] = useState<'P' | 'A' | 'L' | ''>('P');
+  const [masterCorrectionReason, setMasterCorrectionReason] = useState('');
+  const [masterCorrectionSubmitting, setMasterCorrectionSubmitting] = useState(false);
+  const [masterFeedback, setMasterFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   // Selected Date Filter for Attendance
   const todayIST = getISTTimeInfo();
@@ -93,6 +140,28 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
     return typeof window !== 'undefined' ? window.location.origin : '';
   });
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
+
+  // Feature 1: QR Challenge State
+  const [activeQRChallenge, setActiveQRChallenge] = useState<ActiveQRChallenge | null>(null);
+  const [qrHistory, setQrHistory] = useState<any[]>([]);
+  const [isRefreshingQR, setIsRefreshingQR] = useState<boolean>(false);
+  const [showRefreshModal, setShowRefreshModal] = useState<boolean>(false);
+  const [qrSuccessMessage, setQrSuccessMessage] = useState<string | null>(null);
+  const [qrErrorMessage, setQrErrorMessage] = useState<string | null>(null);
+
+  // Feature 2: Geofence Configuration State
+  const [geofenceConfig, setGeofenceConfig] = useState<GeofenceConfig | null>(null);
+  const [geofenceRadiusInput, setGeofenceRadiusInput] = useState<number>(100);
+  const [geofenceAccuracyInput, setGeofenceAccuracyInput] = useState<number>(50);
+  const [isSavingGeofence, setIsSavingGeofence] = useState<boolean>(false);
+  const [geofenceSuccessMessage, setGeofenceSuccessMessage] = useState<string | null>(null);
+  const [geofenceErrorMessage, setGeofenceErrorMessage] = useState<string | null>(null);
+
+  // Feature 2: Location Security Alerts
+  const [locationIncidents, setLocationIncidents] = useState<LocationIncident[]>([]);
+  const [isLoadingIncidents, setIsLoadingIncidents] = useState<boolean>(false);
+  const [incidentFilter, setIncidentFilter] = useState<'all' | 'unreviewed' | 'OUTSIDE_GEOFENCE' | 'INVALID_QR_CHALLENGE'>('all');
+  const [reviewingIncidentId, setReviewingIncidentId] = useState<string | null>(null);
 
   // Holiday Form
   const [holidayDate, setHolidayDate] = useState('');
@@ -126,19 +195,132 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
     return () => clearInterval(interval);
   }, []);
 
-  // Generate QR Data URL
-  useEffect(() => {
-    const origin = typeof window !== 'undefined' ? window.location.origin : '';
-    let isMounted = true;
-    generateClassroomQRDataUrl(origin)
-      .then((url) => {
-        if (isMounted) setQrDataUrl(url);
-      })
-      .catch(console.error);
-    return () => {
-      isMounted = false;
-    };
+  const loadActiveQR = useCallback(async () => {
+    try {
+      const res = await fetch(`/api/attendance/qr/active?adminEmail=${encodeURIComponent(adminEmail)}`);
+      const data = await res.json();
+      if (data.success) {
+        if (data.challenge) setActiveQRChallenge(data.challenge);
+        if (data.qrDataUrl) setQrDataUrl(data.qrDataUrl);
+        if (data.history) setQrHistory(data.history);
+      }
+    } catch (err) {
+      console.error('Failed to load active QR:', err);
+    }
+  }, [adminEmail]);
+
+  const handleRefreshQR = async () => {
+    try {
+      setIsRefreshingQR(true);
+      setQrErrorMessage(null);
+      const res = await fetch('/api/attendance/qr/refresh', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ adminEmail }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to refresh QR');
+      }
+      setActiveQRChallenge(data.challenge);
+      setQrDataUrl(data.qrDataUrl);
+      if (data.history) setQrHistory(data.history);
+      setShowRefreshModal(false);
+      setQrSuccessMessage('Classroom QR successfully refreshed! Previous QR code invalidated immediately.');
+      setTimeout(() => setQrSuccessMessage(null), 6000);
+      loadLocationIncidents();
+    } catch (err: any) {
+      setQrErrorMessage(err.message || 'Error refreshing QR code');
+    } finally {
+      setIsRefreshingQR(false);
+    }
+  };
+
+  const loadGeofenceConfig = useCallback(async () => {
+    try {
+      const res = await fetch('/api/attendance/geofence/config');
+      const data = await res.json();
+      if (data.success && data.config) {
+        setGeofenceConfig(data.config);
+        setGeofenceRadiusInput(data.config.radiusMeters || 100);
+        setGeofenceAccuracyInput(data.config.maxAccuracyMeters || 50);
+      }
+    } catch (err) {
+      console.error('Failed to load geofence config:', err);
+    }
   }, []);
+
+  const handleSaveGeofence = async () => {
+    try {
+      setIsSavingGeofence(true);
+      setGeofenceErrorMessage(null);
+      const res = await fetch('/api/attendance/geofence/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          adminEmail,
+          radiusMeters: Number(geofenceRadiusInput),
+          maxAccuracyMeters: Number(geofenceAccuracyInput),
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to update geofence');
+      }
+      setGeofenceConfig(data.config);
+      setGeofenceSuccessMessage('Institute geofence configuration updated.');
+      setTimeout(() => setGeofenceSuccessMessage(null), 4000);
+    } catch (err: any) {
+      setGeofenceErrorMessage(err.message || 'Failed to update geofence');
+    } finally {
+      setIsSavingGeofence(false);
+    }
+  };
+
+  const loadLocationIncidents = useCallback(async () => {
+    try {
+      setIsLoadingIncidents(true);
+      const res = await fetch(`/api/attendance/incidents?adminEmail=${encodeURIComponent(adminEmail)}`);
+      const data = await res.json();
+      if (data.success && data.incidents) {
+        setLocationIncidents(data.incidents);
+      }
+    } catch (err) {
+      console.error('Failed to load location incidents:', err);
+    } finally {
+      setIsLoadingIncidents(false);
+    }
+  }, [adminEmail]);
+
+  const handleReviewIncident = async (incidentId: string) => {
+    try {
+      setReviewingIncidentId(incidentId);
+      const res = await fetch('/api/attendance/incidents', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ adminEmail, incidentId, action: 'review' }),
+      });
+      const data = await res.json();
+      if (data.success && data.incidents) {
+        setLocationIncidents(data.incidents);
+      }
+    } catch (err) {
+      console.error('Failed to review incident:', err);
+    } finally {
+      setReviewingIncidentId(null);
+    }
+  };
+
+  useEffect(() => {
+    loadActiveQR();
+    loadGeofenceConfig();
+    loadLocationIncidents();
+  }, [loadActiveQR, loadGeofenceConfig, loadLocationIncidents]);
+
+  const unreviewedIncidentsCount = useMemo(
+    () => locationIncidents.filter((i) => i.status === 'New').length,
+    [locationIncidents]
+  );
 
   const loadAllData = useCallback(async () => {
     try {
@@ -207,6 +389,89 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
       isMounted = false;
     };
   }, [selectedDate]);
+
+  // Master Workbook Data Loader
+  const loadMasterData = useCallback(async (targetDate = selectedDate) => {
+    try {
+      setLoadingMaster(true);
+      const [info, daily] = await Promise.all([
+        fetchMasterWorkbookInfo(adminEmail),
+        fetchMasterAttendanceForDate(adminEmail, targetDate),
+      ]);
+      setMasterInfo(info);
+      setMasterDailyData(daily);
+    } catch (err) {
+      console.error('Failed to load master workbook data:', err);
+    } finally {
+      setLoadingMaster(false);
+    }
+  }, [adminEmail, selectedDate]);
+
+  useEffect(() => {
+    loadMasterData(selectedDate);
+  }, [selectedDate, loadMasterData]);
+
+  // Master Workbook Handlers
+  const handleDownloadMasterExcel = () => {
+    triggerMasterWorkbookDownload(adminEmail);
+  };
+
+  const handleConfirmFinalize = async () => {
+    try {
+      setFinalizingSubmitting(true);
+      setMasterFeedback(null);
+      const res = await finalizeMasterDailyAttendance(adminEmail, selectedDate);
+      setFinalizingModalOpen(false);
+      setMasterFeedback({
+        type: 'success',
+        message: res.message || `Successfully finalized daily attendance for ${selectedDate}.`,
+      });
+      await Promise.all([
+        loadMasterData(selectedDate),
+        loadAttendanceForSelectedDate(selectedDate),
+      ]);
+    } catch (err) {
+      setMasterFeedback({
+        type: 'error',
+        message: err instanceof Error ? err.message : 'Finalization failed.',
+      });
+    } finally {
+      setFinalizingSubmitting(false);
+    }
+  };
+
+  const handleConfirmMasterCorrection = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!masterCorrectionModal) return;
+    if (masterCorrectionReason.trim().length < 5) {
+      alert('Mandatory audit reason must be at least 5 characters.');
+      return;
+    }
+    try {
+      setMasterCorrectionSubmitting(true);
+      setMasterFeedback(null);
+      const res = await correctMasterAttendanceEntry({
+        adminEmail,
+        row: masterCorrectionModal.row,
+        date: masterCorrectionModal.date,
+        newStatus: masterCorrectionStatus,
+        reason: masterCorrectionReason.trim(),
+      });
+      setMasterCorrectionModal(null);
+      setMasterFeedback({
+        type: 'success',
+        message: res.message || 'Attendance entry corrected in Master Excel register.',
+      });
+      await Promise.all([
+        loadMasterData(masterCorrectionModal.date),
+        loadAttendanceForSelectedDate(masterCorrectionModal.date),
+      ]);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : 'Correction failed.');
+    } finally {
+      setMasterCorrectionSubmitting(false);
+    }
+  };
 
   // Handle student detail view
   const handleOpenStudentDetail = async (stu: StudentProfile) => {
@@ -508,6 +773,22 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
             Attendance & Students
           </button>
           <button
+            onClick={() => setActiveTab('excel')}
+            className={`px-3.5 py-2 rounded-lg transition whitespace-nowrap flex items-center gap-1.5 ${
+              activeTab === 'excel'
+                ? 'bg-emerald-700 text-white shadow-sm'
+                : 'text-slate-700 hover:text-slate-950 hover:bg-emerald-50'
+            }`}
+          >
+            <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-500" />
+            Official Excel Register
+            {masterInfo && (
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-900 font-bold ml-1 border border-emerald-200">
+                v{masterInfo.version}
+              </span>
+            )}
+          </button>
+          <button
             onClick={() => setActiveTab('qr')}
             className={`px-3.5 py-2 rounded-lg transition whitespace-nowrap flex items-center gap-1.5 ${
               activeTab === 'qr'
@@ -516,7 +797,12 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
             }`}
           >
             <QrCode className="w-3.5 h-3.5" />
-            Print Classroom QR
+            QR & Geofence Security
+            {unreviewedIncidentsCount > 0 && (
+              <span className="ml-1 px-1.5 py-0.5 rounded-full bg-rose-500 text-white font-black text-[10px] animate-pulse">
+                {unreviewedIncidentsCount}
+              </span>
+            )}
           </button>
           <button
             onClick={() => setActiveTab('holidays')}
@@ -610,11 +896,66 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                   Refresh
                 </button>
                 <button
-                  onClick={exportAttendanceCSV}
+                  onClick={() => setFinalizingModalOpen(true)}
+                  className="px-3.5 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 shadow-sm transition"
+                  title="Finalize absences for unrecorded students"
+                >
+                  <CheckCheck className="w-3.5 h-3.5" />
+                  Finalize Daily Attendance
+                </button>
+                <button
+                  onClick={handleDownloadMasterExcel}
                   className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 shadow-sm transition"
+                  title="Download Official Master Excel Workbook"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  Download Master Excel
+                </button>
+              </div>
+            </div>
+
+            {/* Official Master Excel Banner */}
+            <div className="bg-gradient-to-r from-emerald-50 via-teal-50 to-blue-50 border border-emerald-200/80 rounded-2xl p-4 sm:p-5 flex flex-col md:flex-row md:items-center justify-between gap-4 shadow-sm">
+              <div className="flex items-start gap-3">
+                <div className="p-2.5 bg-emerald-600 text-white rounded-xl shadow-sm mt-0.5">
+                  <FileSpreadsheet className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <h3 className="text-sm font-bold text-slate-950">
+                      Official Excel Register: {masterInfo?.workbookName || 'B-19-AI Builder (1) (3).xlsx'}
+                    </h3>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-extrabold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                      Revision v{masterInfo?.version || 1}
+                    </span>
+                    <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-blue-100 text-blue-800 border border-blue-300">
+                      Batch-19 Canonical
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-600 mt-1">
+                    Synchronized with institute master workbook • Selected Date Column:{' '}
+                    <strong className="text-slate-900 font-mono">
+                      {masterDailyData?.column ? `Column ${masterDailyData.column} (${selectedDate})` : `${selectedDate}`}
+                    </strong>
+                    {masterDailyData && ` • ${masterDailyData.presentCount} Present, ${masterDailyData.absentCount} Absent, ${masterDailyData.unmarkedCount} Unmarked`}
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2 flex-shrink-0">
+                <button
+                  onClick={() => setActiveTab('excel')}
+                  className="px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm transition"
                 >
                   <FileSpreadsheet className="w-3.5 h-3.5" />
-                  Export CSV (Excel)
+                  View Full Register
+                </button>
+                <button
+                  onClick={handleDownloadMasterExcel}
+                  className="px-3 py-2 bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 rounded-xl text-xs font-bold flex items-center gap-1.5 shadow-sm transition"
+                >
+                  <Download className="w-3.5 h-3.5 text-emerald-600" />
+                  Download
                 </button>
               </div>
             </div>
@@ -838,90 +1179,969 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
           </div>
         )}
 
-        {/* ===================== TAB 2: PRINTABLE CLASSROOM QR ===================== */}
-        {activeTab === 'qr' && (
-          <div className="max-w-2xl mx-auto space-y-6">
-            <div className="bg-white border border-slate-200 rounded-2xl p-6 sm:p-8 shadow-sm text-center">
-              <div className="inline-flex items-center justify-center p-3 rounded-2xl bg-blue-50 border border-blue-200 text-blue-600 mb-4 shadow-sm">
-                <QrCode className="w-8 h-8" />
-              </div>
-
-              <h2 className="text-2xl font-extrabold text-slate-950 tracking-tight">
-                Official Classroom Attendance QR
-              </h2>
-              <p className="text-sm text-slate-600 mt-1 max-w-md mx-auto">
-                Print this QR code and display it inside the classroom. Students can scan it using their phone&apos;s browser at any time of day.
-              </p>
-
-              {/* Printable Card Area */}
-              <div
-                id="printable-asdc-qr-card"
-                className="my-8 mx-auto p-8 bg-white text-slate-900 rounded-2xl shadow-xl max-w-sm border-4 border-blue-600 flex flex-col items-center"
-              >
-                <div className="text-center mb-4">
-                  <span className="text-xs font-black uppercase tracking-widest text-blue-700 block">
-                    INSTITUTE ATTENDANCE
-                  </span>
-                  <h3 className="text-2xl font-black text-slate-950 mt-0.5">
-                    {INSTITUTE_CONFIG.INSTITUTE_NAME}
-                  </h3>
-                  <p className="text-xs font-bold text-slate-600">
-                    {INSTITUTE_CONFIG.DEFAULT_BATCH_NAME}
-                  </p>
+        {/* ===================== TAB 2: OFFICIAL EXCEL ATTENDANCE REGISTER ===================== */}
+        {activeTab === 'excel' && (
+          <div className="space-y-6 animate-fadeIn">
+            {/* Top Overview & Master Status Banner */}
+            <div className="bg-white border border-slate-200 rounded-2xl p-5 sm:p-6 shadow-sm">
+              <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-4 pb-5 border-b border-slate-100">
+                <div className="flex items-start gap-3.5">
+                  <div className="p-3 bg-emerald-600 text-white rounded-2xl shadow-sm">
+                    <FileSpreadsheet className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h2 className="text-lg font-extrabold text-slate-950 tracking-tight">
+                        Official Excel Attendance Register
+                      </h2>
+                      <span className="px-2.5 py-0.5 rounded-full text-xs font-extrabold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                        Revision v{masterInfo?.version || 1}
+                      </span>
+                      <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-blue-100 text-blue-800 border border-blue-200">
+                        {masterInfo?.batchName || 'BATCH-19 (AI Builder)'}
+                      </span>
+                    </div>
+                    <p className="text-xs text-slate-500 mt-1">
+                      Canonical Workbook: <strong className="font-mono text-slate-800">{masterInfo?.workbookName || 'B-19-AI Builder (1) (3).xlsx'}</strong> • Sheet: <span className="font-medium">{masterInfo?.worksheetName || 'B-19-AI Builder'}</span>
+                    </p>
+                  </div>
                 </div>
 
-                {qrDataUrl ? (
-                  <div className="p-3 bg-white border-2 border-slate-200 rounded-xl shadow-inner">
-                    {/* eslint-disable-next-line @next/next/no-img-element */}
-                    <img
-                      src={qrDataUrl}
-                      alt="ASDC Classroom Attendance QR Code"
-                      className="w-56 h-56 object-contain"
-                    />
-                  </div>
-                ) : (
-                  <div className="w-56 h-56 flex items-center justify-center bg-slate-50 rounded-xl">
-                    <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
-                  </div>
-                )}
+                <div className="flex flex-wrap items-center gap-2.5">
+                  <button
+                    onClick={() => loadMasterData(selectedDate)}
+                    disabled={loadingMaster}
+                    className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl text-xs font-bold flex items-center gap-1.5 transition border border-slate-200"
+                    title="Reload Master Register Data"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${loadingMaster ? 'animate-spin' : ''}`} />
+                    Refresh
+                  </button>
 
-                <div className="mt-4 text-center">
-                  <span className="inline-block px-3 py-1 bg-blue-50 border border-blue-200 text-blue-900 text-xs font-bold rounded-lg mb-2">
-                    Availability: Open Anytime 24/7
-                  </span>
-                  <p className="text-[11px] text-slate-500 font-mono break-all leading-tight">
-                    {currentAppOrigin}
-                  </p>
-                </div>
-              </div>
+                  <button
+                    onClick={() => setFinalizingModalOpen(true)}
+                    className="px-4 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-sm transition"
+                    title="Mark unrecorded students as Absent for selected date"
+                  >
+                    <CheckCheck className="w-4 h-4" />
+                    Finalize Daily Attendance
+                  </button>
 
-              {/* Action Buttons */}
-              <div className="flex flex-wrap items-center justify-center gap-3">
-                <button
-                  onClick={() => window.print()}
-                  className="px-5 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded-xl flex items-center gap-2 shadow-md shadow-blue-500/20 transition"
-                >
-                  <Printer className="w-4 h-4" />
-                  Print Classroom QR Code
-                </button>
-                {qrDataUrl && (
-                  <a
-                    href={qrDataUrl}
-                    download="ASDC_Classroom_Attendance_QR.png"
-                    className="px-5 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-200 font-bold text-xs rounded-xl flex items-center gap-2 transition"
+                  <button
+                    onClick={handleDownloadMasterExcel}
+                    className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-md transition"
+                    title="Download canonical master .xlsx file"
                   >
                     <Download className="w-4 h-4" />
-                    Download PNG
-                  </a>
-                )}
+                    Download Latest Master Excel
+                  </button>
+                </div>
               </div>
 
-              <div className="mt-6 p-4 bg-slate-50 border border-slate-200 rounded-xl text-left text-xs text-slate-600 space-y-1.5 font-medium">
-                <p className="font-bold text-slate-900">Security & Operational Notes:</p>
-                <p>• The QR code embeds your exact deployment URL and the institute batch cryptographic key.</p>
-                <p>• Only registered students in &apos;AI Builder Mastery&apos; can mark attendance.</p>
-                <p>• Duplicate scans by the same student on the same date will not create duplicates.</p>
-                <p>• Students can scan at any time of day (morning, afternoon, evening, night).</p>
+              {/* Status Metadata Bar */}
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 pt-4 text-xs">
+                <div>
+                  <span className="text-slate-400 block text-[11px] font-bold uppercase tracking-wider">Sync Status</span>
+                  <div className="flex items-center gap-1.5 mt-0.5">
+                    <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                    <span className="font-extrabold text-emerald-800">
+                      {masterInfo?.syncStatus === 'ERROR' ? 'Needs Attention' : 'Synchronized & Persistent'}
+                    </span>
+                  </div>
+                </div>
+
+                <div>
+                  <span className="text-slate-400 block text-[11px] font-bold uppercase tracking-wider">Last Master Sync</span>
+                  <span className="font-semibold text-slate-800 mt-0.5 block">
+                    {masterInfo?.lastSyncedAt ? formatDisplayTimestamp(masterInfo.lastSyncedAt) : 'Ready'}
+                  </span>
+                </div>
+
+                <div>
+                  <span className="text-slate-400 block text-[11px] font-bold uppercase tracking-wider">Total Enrolled</span>
+                  <span className="font-extrabold text-slate-900 mt-0.5 block">
+                    {masterInfo?.totalStudents || 24} Verified Students
+                  </span>
+                </div>
+
+                <div>
+                  <span className="text-slate-400 block text-[11px] font-bold uppercase tracking-wider">Calendar Bounds</span>
+                  <span className="font-mono text-slate-700 mt-0.5 block">
+                    {masterInfo?.startDate} → {masterInfo?.endDate}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Notification Feedback Toast */}
+            {masterFeedback && (
+              <div
+                className={`p-4 rounded-xl text-xs font-medium flex items-center justify-between border ${
+                  masterFeedback.type === 'success'
+                    ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
+                    : 'bg-rose-50 text-rose-900 border-rose-200'
+                }`}
+              >
+                <div className="flex items-center gap-2">
+                  {masterFeedback.type === 'success' ? (
+                    <CheckCircle className="w-4 h-4 text-emerald-600 flex-shrink-0" />
+                  ) : (
+                    <AlertCircle className="w-4 h-4 text-rose-600 flex-shrink-0" />
+                  )}
+                  <span>{masterFeedback.message}</span>
+                </div>
+                <button
+                  onClick={() => setMasterFeedback(null)}
+                  className="text-slate-400 hover:text-slate-700 text-xs font-bold px-2 py-0.5"
+                >
+                  ✕
+                </button>
+              </div>
+            )}
+
+            {/* Selected Date Inspector & Quick Actions */}
+            <div className="bg-white border border-slate-200 rounded-2xl p-5 shadow-sm space-y-4">
+              <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+                <div className="flex flex-wrap items-center gap-3">
+                  <div className="flex items-center gap-2">
+                    <Calendar className="w-4 h-4 text-emerald-700" />
+                    <span className="text-xs font-bold uppercase tracking-wider text-slate-700">
+                      Attendance Date:
+                    </span>
+                  </div>
+                  <input
+                    type="date"
+                    value={selectedDate}
+                    onChange={(e) => setSelectedDate(e.target.value)}
+                    className="px-3 py-1.5 bg-slate-50 border border-slate-300 rounded-lg text-xs font-mono font-bold text-slate-900 focus:outline-none focus:ring-2 focus:ring-emerald-500"
+                  />
+                  {selectedDate === todayIST.dateString && (
+                    <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-blue-100 text-blue-800 border border-blue-200">
+                      Today ({liveIstTime})
+                    </span>
+                  )}
+                  {masterDailyData?.column && (
+                    <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-full bg-emerald-100 text-emerald-800 border border-emerald-300">
+                      Mapped to Column {masterDailyData.column} ({masterDailyData.weekday})
+                    </span>
+                  )}
+                </div>
+
+                {/* Quick Date Navigation */}
+                <div className="flex items-center gap-1.5 text-xs">
+                  <button
+                    onClick={() => {
+                      const d = new Date(selectedDate);
+                      d.setDate(d.getDate() - 1);
+                      const prevStr = d.toISOString().split('T')[0];
+                      setSelectedDate(prevStr);
+                    }}
+                    className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-bold border border-slate-200"
+                  >
+                    ← Previous Day
+                  </button>
+                  <button
+                    onClick={() => setSelectedDate(todayIST.dateString)}
+                    className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-bold border border-slate-200"
+                  >
+                    Today
+                  </button>
+                  <button
+                    onClick={() => {
+                      const d = new Date(selectedDate);
+                      d.setDate(d.getDate() + 1);
+                      const nextStr = d.toISOString().split('T')[0];
+                      setSelectedDate(nextStr);
+                    }}
+                    className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-bold border border-slate-200"
+                  >
+                    Next Day →
+                  </button>
+                </div>
+              </div>
+
+              {/* Date Attendance Metrics Cards */}
+              <div className="grid grid-cols-2 lg:grid-cols-4 gap-3 pt-1">
+                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-slate-500 block">
+                    Total Students
+                  </span>
+                  <span className="text-2xl font-extrabold text-slate-900 mt-1 block">
+                    {masterInfo?.totalStudents || 24}
+                  </span>
+                  <span className="text-[10px] text-slate-500 block mt-0.5">
+                    Official Batch-19 Roster
+                  </span>
+                </div>
+
+                <div className="bg-emerald-50/60 border border-emerald-200 rounded-xl p-3.5">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-800 block">
+                    Present (P)
+                  </span>
+                  <span className="text-2xl font-extrabold text-emerald-700 mt-1 block">
+                    {masterDailyData?.presentCount || 0}
+                  </span>
+                  <span className="text-[10px] text-emerald-700 block mt-0.5">
+                    Verified classroom scans
+                  </span>
+                </div>
+
+                <div className="bg-rose-50/60 border border-rose-200 rounded-xl p-3.5">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-rose-800 block">
+                    Absent (A)
+                  </span>
+                  <span className="text-2xl font-extrabold text-rose-700 mt-1 block">
+                    {masterDailyData?.absentCount || 0}
+                  </span>
+                  <span className="text-[10px] text-rose-700 block mt-0.5">
+                    Confirmed absences
+                  </span>
+                </div>
+
+                <div className="bg-amber-50/60 border border-amber-200 rounded-xl p-3.5">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-amber-800 block">
+                    Unmarked
+                  </span>
+                  <span className="text-2xl font-extrabold text-amber-700 mt-1 block">
+                    {masterDailyData?.unmarkedCount || 0}
+                  </span>
+                  <span className="text-[10px] text-amber-700 block mt-0.5">
+                    Pending finalization
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* Master Attendance Register Table */}
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+              <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/50">
+                <div>
+                  <h3 className="text-sm font-bold text-slate-950">
+                    Student Register Records ({masterDailyData?.records.length || masterInfo?.students.length || 24} Students)
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Showing status for <strong className="text-slate-800 font-mono">{selectedDate}</strong> (Column {masterDailyData?.column || 'N/A'}) with cumulative totals.
+                  </p>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-slate-500 font-medium">Status Legend:</span>
+                  <span className="px-2 py-0.5 text-[10px] font-extrabold rounded bg-emerald-100 text-emerald-800 border border-emerald-300">
+                    P = Present
+                  </span>
+                  <span className="px-2 py-0.5 text-[10px] font-extrabold rounded bg-rose-100 text-rose-800 border border-rose-300">
+                    A = Absent
+                  </span>
+                  <span className="px-2 py-0.5 text-[10px] font-extrabold rounded bg-amber-100 text-amber-800 border border-amber-300">
+                    L = Leave
+                  </span>
+                </div>
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-left text-xs">
+                  <thead className="bg-slate-100/75 text-slate-700 font-bold uppercase text-[11px] tracking-wider border-b border-slate-200">
+                    <tr>
+                      <th className="py-3 px-3">S.NO</th>
+                      <th className="py-3 px-4">Student Name</th>
+                      <th className="py-3 px-3">Timing</th>
+                      <th className="py-3 px-2 text-center">Total (G)</th>
+                      <th className="py-3 px-2 text-center text-emerald-700">P (H)</th>
+                      <th className="py-3 px-2 text-center text-rose-700">A (I)</th>
+                      <th className="py-3 px-2 text-center text-amber-700">L (J)</th>
+                      <th className="py-3 px-3 text-center">Attendance % (K)</th>
+                      <th className="py-3 px-4 text-center bg-blue-50/80 text-blue-900 border-x border-blue-200">
+                        {selectedDate} Status
+                      </th>
+                      <th className="py-3 px-3 text-right">Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-100 font-medium">
+                    {(masterDailyData?.records || []).map((rec, idx) => {
+                      const studentObj = masterInfo?.students.find((s) => s.row === rec.row);
+                      return (
+                        <tr key={rec.row} className="hover:bg-slate-50/80 transition">
+                          <td className="py-3 px-3 font-mono text-slate-500">
+                            {rec.sno || idx + 1}
+                          </td>
+                          <td className="py-3 px-4">
+                            <span className="font-bold text-slate-900 block">{rec.name}</span>
+                            <span className="text-[11px] text-slate-400 font-mono">
+                              Row {rec.row} {rec.admissionNo ? `• Adm: ${rec.admissionNo}` : ''}
+                            </span>
+                          </td>
+                          <td className="py-3 px-3 text-slate-600">
+                            {studentObj?.timing || 'Evening (5pm to 9pm)'}
+                          </td>
+                          <td className="py-3 px-2 text-center font-bold text-slate-700">
+                            {studentObj?.total ?? 90}
+                          </td>
+                          <td className="py-3 px-2 text-center font-bold text-emerald-700">
+                            {studentObj?.present ?? 0}
+                          </td>
+                          <td className="py-3 px-2 text-center font-bold text-rose-700">
+                            {studentObj?.absent ?? 0}
+                          </td>
+                          <td className="py-3 px-2 text-center font-bold text-amber-700">
+                            {studentObj?.leave ?? 0}
+                          </td>
+                          <td className="py-3 px-3 text-center">
+                            <span className="font-bold text-slate-900">
+                              {studentObj ? Math.round(studentObj.percentage * 100) : 0}%
+                            </span>
+                          </td>
+                          <td className="py-3 px-4 text-center bg-blue-50/30 border-x border-blue-100">
+                            {rec.status === 'P' ? (
+                              <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-extrabold bg-emerald-100 text-emerald-800 border border-emerald-300 shadow-xs">
+                                <CheckCircle className="w-3.5 h-3.5 text-emerald-600" />
+                                Present (P)
+                              </span>
+                            ) : rec.status === 'A' ? (
+                              <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-extrabold bg-rose-100 text-rose-800 border border-rose-300 shadow-xs">
+                                <XCircle className="w-3.5 h-3.5 text-rose-600" />
+                                Absent (A)
+                              </span>
+                            ) : rec.status === 'L' ? (
+                              <span className="inline-flex items-center gap-1 px-3 py-1 rounded-full text-xs font-extrabold bg-amber-100 text-amber-800 border border-amber-300 shadow-xs">
+                                Leave (L)
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-semibold bg-slate-100 text-slate-500 border border-slate-200">
+                                Unmarked
+                              </span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3 text-right">
+                            <button
+                              onClick={() => {
+                                setMasterCorrectionModal({
+                                  row: rec.row,
+                                  studentName: rec.name,
+                                  currentStatus: rec.status,
+                                  date: selectedDate,
+                                  cellRef: rec.cellRef,
+                                });
+                                setMasterCorrectionStatus(rec.status || 'P');
+                                setMasterCorrectionReason('');
+                              }}
+                              className="px-2.5 py-1 text-slate-600 hover:text-blue-700 hover:bg-blue-50 rounded-lg text-xs font-bold transition border border-slate-200 inline-flex items-center gap-1"
+                              title="Correct attendance entry in Master Excel"
+                            >
+                              <Edit className="w-3 h-3" />
+                              Correct
+                            </button>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Synchronization & Matching Errors Section */}
+            {masterInfo?.errors && masterInfo.errors.length > 0 && (
+              <div className="bg-rose-50 border border-rose-200 rounded-2xl p-5 shadow-sm space-y-3">
+                <div className="flex items-center gap-2 text-rose-800">
+                  <AlertTriangle className="w-5 h-5 flex-shrink-0" />
+                  <h4 className="text-sm font-bold">Synchronization & Matching Notices</h4>
+                </div>
+                <div className="space-y-1.5 text-xs text-rose-700">
+                  {masterInfo.errors.map((err, i) => (
+                    <div key={i} className="flex items-start gap-2 bg-white/70 p-2.5 rounded-lg border border-rose-200">
+                      <span className="font-mono text-rose-500 font-bold">#{i + 1}</span>
+                      <span>{err}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* ===================== TAB 3: QR CODE & GEOFENCE SECURITY ===================== */}
+        {activeTab === 'qr' && (
+          <div className="space-y-8 max-w-5xl mx-auto">
+            {/* Refresh Confirmation Modal */}
+            {showRefreshModal && (
+              <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-sm animate-fadeIn">
+                <div className="w-full max-w-md bg-white border border-slate-200 rounded-3xl p-6 shadow-2xl space-y-4">
+                  <div className="flex items-center gap-3">
+                    <div className="p-3 bg-amber-50 text-amber-600 rounded-2xl border border-amber-200">
+                      <AlertTriangle className="w-6 h-6" />
+                    </div>
+                    <div>
+                      <h3 className="text-base font-extrabold text-slate-950">Refresh Classroom QR Code?</h3>
+                      <p className="text-xs text-slate-500 font-medium">Immediate invalidation of existing codes</p>
+                    </div>
+                  </div>
+
+                  <div className="p-3.5 bg-amber-50/70 border border-amber-200 rounded-xl text-xs text-amber-900 leading-relaxed font-medium space-y-1.5">
+                    <p>• Generating a new QR code will <strong>IMMEDIATELY invalidate</strong> the current QR code on the backend.</p>
+                    <p>• Any previous QR codes, screenshots, or saved images will fail validation instantly.</p>
+                    <p>• Students must scan the newly generated QR code to mark attendance.</p>
+                  </div>
+
+                  <div className="flex items-center justify-end gap-2.5 pt-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowRefreshModal(false)}
+                      disabled={isRefreshingQR}
+                      className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-100 font-bold text-xs transition"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="button"
+                      onClick={handleRefreshQR}
+                      disabled={isRefreshingQR}
+                      className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs flex items-center gap-2 shadow-md transition disabled:opacity-50"
+                    >
+                      {isRefreshingQR ? (
+                        <>
+                          <RefreshCw className="w-4 h-4 animate-spin" />
+                          Generating New Token...
+                        </>
+                      ) : (
+                        <>
+                          <RefreshCw className="w-4 h-4" />
+                          Confirm & Invalidate Previous QR
+                        </>
+                      )}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {/* Success & Error Banners */}
+            {qrSuccessMessage && (
+              <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-2xl flex items-center gap-3 text-emerald-900 text-xs font-semibold animate-fadeIn shadow-sm">
+                <CheckCircle className="w-5 h-5 text-emerald-600 flex-shrink-0" />
+                <span>{qrSuccessMessage}</span>
+              </div>
+            )}
+            {qrErrorMessage && (
+              <div className="p-4 bg-rose-50 border border-rose-200 rounded-2xl flex items-center gap-3 text-rose-900 text-xs font-semibold animate-fadeIn shadow-sm">
+                <AlertCircle className="w-5 h-5 text-rose-600 flex-shrink-0" />
+                <span>{qrErrorMessage}</span>
+              </div>
+            )}
+
+            {/* 1. ADMIN QR CODE MANAGEMENT */}
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+              <div className="p-5 sm:p-6 border-b border-slate-200 bg-slate-50 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="p-2.5 rounded-xl bg-blue-600 text-white shadow-sm">
+                    <QrCode className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-extrabold text-slate-950">Classroom Attendance QR Code</h3>
+                    <p className="text-xs text-slate-500 font-medium">
+                      Cryptographically protected token • Authorized Admin: {SOLE_ADMIN_EMAIL}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2.5">
+                  <button
+                    type="button"
+                    onClick={() => setShowRefreshModal(true)}
+                    className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded-xl flex items-center gap-2 shadow-sm transition"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Refresh QR Code
+                  </button>
+                </div>
+              </div>
+
+              <div className="p-6 grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
+                {/* QR Status & Info Column */}
+                <div className="lg:col-span-6 space-y-4">
+                  {/* Status Badges */}
+                  <div className="grid grid-cols-2 gap-3">
+                    <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl">
+                      <span className="text-[11px] font-bold text-slate-500 block">QR Status</span>
+                      <div className="flex items-center gap-1.5 mt-1">
+                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
+                        <span className="font-extrabold text-xs text-emerald-700">
+                          {activeQRChallenge?.status || 'ACTIVE'}
+                        </span>
+                      </div>
+                    </div>
+                    <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl">
+                      <span className="text-[11px] font-bold text-slate-500 block">Last Refreshed</span>
+                      <span className="font-mono font-bold text-xs text-slate-800 mt-1 block">
+                        {activeQRChallenge?.generatedAt
+                          ? formatDisplayTimestamp(activeQRChallenge.generatedAt)
+                          : 'Initial System Token'}
+                      </span>
+                    </div>
+                  </div>
+
+                  {/* Active Token Chip */}
+                  <div className="p-4 bg-slate-900 text-slate-100 rounded-xl border border-slate-800 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-[11px] font-mono text-amber-400 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                        <Radio className="w-3.5 h-3.5 animate-pulse" />
+                        Active Challenge Token
+                      </span>
+                      <span className="text-[10px] bg-slate-800 text-slate-300 px-2 py-0.5 rounded-full font-mono">
+                        Opaque UUID
+                      </span>
+                    </div>
+                    <p className="font-mono text-xs break-all text-emerald-400 font-bold bg-slate-950 p-2.5 rounded-lg border border-slate-800">
+                      {activeQRChallenge?.challengeId || 'Loading active token...'}
+                    </p>
+                    <p className="text-[11px] text-slate-400">
+                      Generated by: <strong className="text-slate-200">{activeQRChallenge?.generatedBy || SOLE_ADMIN_EMAIL}</strong>
+                    </p>
+                  </div>
+
+                  {/* Security Note */}
+                  <div className="p-4 bg-blue-50/70 border border-blue-200 rounded-xl text-xs text-blue-900 space-y-1 font-medium">
+                    <p className="font-extrabold text-blue-950 flex items-center gap-1.5">
+                      <Shield className="w-3.5 h-3.5 text-blue-600" /> Invalidation Protection
+                    </p>
+                    <p>• Whenever you click &quot;Refresh QR Code&quot;, any previously displayed QR is immediately revoked.</p>
+                    <p>• Students who saved screenshots or photos of previous QR codes will receive an immediate rejection.</p>
+                    <p>• All refreshes are securely logged with admin attribution.</p>
+                  </div>
+
+                  {/* QR History Table (Recent Refreshes) */}
+                  {qrHistory && qrHistory.length > 1 && (
+                    <div className="border border-slate-200 rounded-xl overflow-hidden">
+                      <div className="p-3 bg-slate-50 border-b border-slate-200 text-xs font-extrabold text-slate-800 flex items-center justify-between">
+                        <span>QR Refresh Audit Log ({qrHistory.length - 1} previous)</span>
+                      </div>
+                      <div className="max-h-40 overflow-y-auto divide-y divide-slate-100 text-[11px]">
+                        {qrHistory.slice(1, 6).map((item, idx) => (
+                          <div key={idx} className="p-2.5 flex items-center justify-between hover:bg-slate-50">
+                            <div>
+                              <span className="font-mono text-slate-700 font-bold block truncate w-48">
+                                {item.challengeId}
+                              </span>
+                              <span className="text-[10px] text-slate-500">
+                                Invalidated: {item.invalidatedAt ? formatDisplayTimestamp(item.invalidatedAt) : 'Replaced'}
+                              </span>
+                            </div>
+                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
+                              INVALIDATED
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Printable Card Area */}
+                <div className="lg:col-span-6 flex flex-col items-center">
+                  <div
+                    id="printable-asdc-qr-card"
+                    className="w-full max-w-sm p-6 bg-white text-slate-900 rounded-2xl shadow-lg border-4 border-blue-600 flex flex-col items-center text-center"
+                  >
+                    <div className="mb-3">
+                      <span className="text-[10px] font-black uppercase tracking-widest text-blue-700 block">
+                        INSTITUTE ATTENDANCE
+                      </span>
+                      <h3 className="text-xl font-black text-slate-950 mt-0.5">
+                        {INSTITUTE_CONFIG.INSTITUTE_NAME}
+                      </h3>
+                      <p className="text-xs font-bold text-slate-600">
+                        {INSTITUTE_CONFIG.DEFAULT_BATCH_NAME}
+                      </p>
+                    </div>
+
+                    {qrDataUrl ? (
+                      <div className="p-2.5 bg-white border-2 border-slate-200 rounded-xl shadow-inner">
+                        {/* eslint-disable-next-line @next/next/no-img-element */}
+                        <img
+                          src={qrDataUrl}
+                          alt="ASDC Classroom Attendance QR Code"
+                          className="w-52 h-52 object-contain"
+                        />
+                      </div>
+                    ) : (
+                      <div className="w-52 h-52 flex items-center justify-center bg-slate-50 rounded-xl">
+                        <div className="w-6 h-6 border-2 border-blue-600 border-t-transparent rounded-full animate-spin" />
+                      </div>
+                    )}
+
+                    <div className="mt-3 text-center">
+                      <span className="inline-block px-3 py-0.5 bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-bold rounded-lg mb-1">
+                        Live Active QR
+                      </span>
+                      <p className="text-[10px] text-slate-500 font-mono break-all leading-tight">
+                        Token: {activeQRChallenge?.challengeId ? `${activeQRChallenge.challengeId.slice(0, 16)}...` : 'Connecting...'}
+                      </p>
+                    </div>
+                  </div>
+
+                  {/* Print & Download Buttons */}
+                  <div className="flex flex-wrap items-center justify-center gap-2.5 mt-4">
+                    <button
+                      onClick={() => window.print()}
+                      className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 shadow-sm transition"
+                    >
+                      <Printer className="w-3.5 h-3.5" />
+                      Print QR Code
+                    </button>
+                    {qrDataUrl && (
+                      <a
+                        href={qrDataUrl}
+                        download={`ASDC_Classroom_QR_${activeQRChallenge?.challengeId?.slice(0, 8) || 'active'}.png`}
+                        className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-200 font-bold text-xs rounded-xl flex items-center gap-1.5 transition"
+                      >
+                        <Download className="w-3.5 h-3.5" />
+                        Download PNG
+                      </a>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* 2. OFFICIAL ASDC GEOFENCE CONFIGURATION */}
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+              <div className="p-5 sm:p-6 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className="p-2.5 rounded-xl bg-emerald-600 text-white shadow-sm">
+                    <Crosshair className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-extrabold text-slate-950">Official ASDC Institute Geofence</h3>
+                    <p className="text-xs text-slate-500 font-medium">
+                      Attendance is strictly restricted to physical presence at the ASDC institute campus
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="p-6 space-y-6">
+                {/* Official ASDC Campus Address & Verified Pin */}
+                <div className="p-4 bg-emerald-50/70 border border-emerald-200 rounded-2xl flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
+                  <div className="space-y-1">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-emerald-800 block">
+                      VERIFIED OFFICIAL INSTITUTE LOCATION
+                    </span>
+                    <h4 className="text-sm font-extrabold text-slate-950">
+                      Advanced Skills Development Center (ASDC)
+                    </h4>
+                    <p className="text-xs text-slate-600 font-medium max-w-xl">
+                      Shah Ali Banda Road, beside Masjid Aamwali, near Sultan-ul-Uloom School, Qazipura, Hyderabad, Telangana 500002, India
+                    </p>
+                    <div className="flex flex-wrap items-center gap-2 pt-1 font-mono text-xs text-emerald-900 font-bold">
+                      <span className="px-2 py-0.5 bg-white rounded border border-emerald-300">
+                        Lat: 17.34668005
+                      </span>
+                      <span className="px-2 py-0.5 bg-white rounded border border-emerald-300">
+                        Lon: 78.46089325
+                      </span>
+                      <span className="px-2 py-0.5 bg-emerald-100 text-emerald-800 rounded">
+                        Asia/Kolkata (IST)
+                      </span>
+                    </div>
+                  </div>
+
+                  <a
+                    href="https://maps.app.goo.gl/MfGyprjpRgzpwjsV7"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 shadow-sm transition whitespace-nowrap"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    Open in Google Maps
+                  </a>
+                </div>
+
+                {/* Geofence Parameters Form */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-6 bg-slate-50 p-5 rounded-2xl border border-slate-200">
+                  {/* Radius Slider & Input */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs font-extrabold text-slate-900">
+                        Permitted Geofence Radius
+                      </label>
+                      <span className="text-xs font-mono font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                        {geofenceRadiusInput} metres
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={20}
+                      max={500}
+                      step={5}
+                      value={geofenceRadiusInput}
+                      onChange={(e) => setGeofenceRadiusInput(Number(e.target.value))}
+                      className="w-full accent-blue-600"
+                    />
+                    <p className="text-[11px] text-slate-500">
+                      Students beyond this distance from ASDC center are immediately rejected and logged in security alerts.
+                    </p>
+                  </div>
+
+                  {/* Accuracy Slider & Input */}
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between">
+                      <label className="text-xs font-extrabold text-slate-900">
+                        Max Allowed GPS Accuracy Uncertainty
+                      </label>
+                      <span className="text-xs font-mono font-bold text-blue-700 bg-blue-50 px-2 py-0.5 rounded border border-blue-200">
+                        ±{geofenceAccuracyInput} metres
+                      </span>
+                    </div>
+                    <input
+                      type="range"
+                      min={10}
+                      max={150}
+                      step={5}
+                      value={geofenceAccuracyInput}
+                      onChange={(e) => setGeofenceAccuracyInput(Number(e.target.value))}
+                      className="w-full accent-blue-600"
+                    />
+                    <p className="text-[11px] text-slate-500">
+                      Prevents spoofed or coarse IP fallbacks. Submissions with uncertainty &gt; {geofenceAccuracyInput}m are asked to retry.
+                    </p>
+                  </div>
+                </div>
+
+                {geofenceSuccessMessage && (
+                  <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-xs text-emerald-900 font-bold flex items-center gap-2">
+                    <CheckCircle className="w-4 h-4 text-emerald-600" />
+                    {geofenceSuccessMessage}
+                  </div>
+                )}
+                {geofenceErrorMessage && (
+                  <div className="p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-900 font-bold flex items-center gap-2">
+                    <AlertCircle className="w-4 h-4 text-rose-600" />
+                    {geofenceErrorMessage}
+                  </div>
+                )}
+
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleSaveGeofence}
+                    disabled={isSavingGeofence}
+                    className="px-5 py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl flex items-center gap-2 shadow-sm transition disabled:opacity-50"
+                  >
+                    {isSavingGeofence ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
+                    Save Geofence Settings
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* 3. LOCATION SECURITY ALERTS & INCIDENT LOG */}
+            <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
+              <div className="p-5 sm:p-6 border-b border-slate-200 bg-slate-50 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div className="flex items-center gap-3">
+                  <div className="p-2.5 rounded-xl bg-rose-600 text-white shadow-sm">
+                    <Shield className="w-5 h-5" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-extrabold text-slate-950 flex items-center gap-2">
+                      Location Security Alerts & Violations Log
+                      {unreviewedIncidentsCount > 0 && (
+                        <span className="px-2 py-0.5 rounded-full bg-rose-500 text-white font-black text-[11px] animate-pulse">
+                          {unreviewedIncidentsCount} New
+                        </span>
+                      )}
+                    </h3>
+                    <p className="text-xs text-slate-500 font-medium">
+                      Authoritative audit record of rejected scans, out-of-campus attempts, and expired QR submissions
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => loadLocationIncidents()}
+                    disabled={isLoadingIncidents}
+                    className="p-2 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-100 transition"
+                    title="Refresh Incident Log"
+                  >
+                    <RefreshCw className={`w-4 h-4 ${isLoadingIncidents ? 'animate-spin' : ''}`} />
+                  </button>
+                </div>
+              </div>
+
+              {/* Incidents Summary Metric Pills */}
+              <div className="p-5 border-b border-slate-200 grid grid-cols-2 sm:grid-cols-4 gap-3 bg-slate-50/50">
+                <div className="p-3 bg-white border border-slate-200 rounded-xl">
+                  <span className="text-[11px] font-bold text-slate-500 block">Total Alerts</span>
+                  <span className="text-lg font-black text-slate-900">{locationIncidents.length}</span>
+                </div>
+                <div className="p-3 bg-white border border-slate-200 rounded-xl">
+                  <span className="text-[11px] font-bold text-rose-600 block">Unreviewed</span>
+                  <span className="text-lg font-black text-rose-600">{unreviewedIncidentsCount}</span>
+                </div>
+                <div className="p-3 bg-white border border-slate-200 rounded-xl">
+                  <span className="text-[11px] font-bold text-slate-500 block">Outside Geofence</span>
+                  <span className="text-lg font-black text-slate-900">
+                    {locationIncidents.filter((i) => i.incidentType === 'OUTSIDE_GEOFENCE').length}
+                  </span>
+                </div>
+                <div className="p-3 bg-white border border-slate-200 rounded-xl">
+                  <span className="text-[11px] font-bold text-slate-500 block">Invalid QR Scans</span>
+                  <span className="text-lg font-black text-slate-900">
+                    {locationIncidents.filter((i) => i.incidentType === 'INVALID_QR_CHALLENGE').length}
+                  </span>
+                </div>
+              </div>
+
+              {/* Incident Filter Bar */}
+              <div className="px-5 py-3 border-b border-slate-200 flex items-center gap-2 text-xs font-semibold overflow-x-auto">
+                <span className="text-slate-500 font-bold mr-1">Filter:</span>
+                <button
+                  type="button"
+                  onClick={() => setIncidentFilter('all')}
+                  className={`px-3 py-1 rounded-lg transition ${
+                    incidentFilter === 'all'
+                      ? 'bg-slate-900 text-white shadow-sm'
+                      : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                  }`}
+                >
+                  All ({locationIncidents.length})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIncidentFilter('unreviewed')}
+                  className={`px-3 py-1 rounded-lg transition ${
+                    incidentFilter === 'unreviewed'
+                      ? 'bg-rose-600 text-white shadow-sm'
+                      : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                  }`}
+                >
+                  Unreviewed ({unreviewedIncidentsCount})
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIncidentFilter('OUTSIDE_GEOFENCE')}
+                  className={`px-3 py-1 rounded-lg transition ${
+                    incidentFilter === 'OUTSIDE_GEOFENCE'
+                      ? 'bg-amber-600 text-white shadow-sm'
+                      : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                  }`}
+                >
+                  Outside Campus
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIncidentFilter('INVALID_QR_CHALLENGE')}
+                  className={`px-3 py-1 rounded-lg transition ${
+                    incidentFilter === 'INVALID_QR_CHALLENGE'
+                      ? 'bg-blue-600 text-white shadow-sm'
+                      : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                  }`}
+                >
+                  Invalid / Expired QR
+                </button>
+              </div>
+
+              {/* Incident Table */}
+              <div className="overflow-x-auto">
+                {locationIncidents.length === 0 ? (
+                  <div className="p-12 text-center text-xs text-slate-500 font-medium">
+                    <CheckCircle className="w-8 h-8 text-emerald-500 mx-auto mb-2" />
+                    No security violations recorded. Physical attendance is fully verified within campus.
+                  </div>
+                ) : (
+                  <table className="w-full text-left text-xs">
+                    <thead>
+                      <tr className="bg-slate-50 border-b border-slate-200 text-slate-600 font-extrabold uppercase text-[10px] tracking-wider">
+                        <th className="py-3 px-4">Time (IST)</th>
+                        <th className="py-3 px-4">Student</th>
+                        <th className="py-3 px-4">Violation Type</th>
+                        <th className="py-3 px-4">Reported Distance</th>
+                        <th className="py-3 px-4">Accuracy</th>
+                        <th className="py-3 px-4">Status</th>
+                        <th className="py-3 px-4 text-right">Action</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {locationIncidents
+                        .filter((inc) => {
+                          if (incidentFilter === 'unreviewed') return inc.status === 'New';
+                          if (incidentFilter === 'OUTSIDE_GEOFENCE') return inc.incidentType === 'OUTSIDE_GEOFENCE';
+                          if (incidentFilter === 'INVALID_QR_CHALLENGE') return inc.incidentType === 'INVALID_QR_CHALLENGE';
+                          return true;
+                        })
+                        .map((incident) => (
+                          <tr key={incident.id} className="hover:bg-slate-50/80 transition">
+                            <td className="py-3 px-4 font-mono font-medium text-slate-600 whitespace-nowrap">
+                              {formatDisplayTimestamp(incident.timestamp)}
+                            </td>
+                            <td className="py-3 px-4">
+                              <span className="font-bold text-slate-900 block">{incident.studentName}</span>
+                              <span className="font-mono text-[11px] text-slate-500">{incident.studentId}</span>
+                            </td>
+                            <td className="py-3 px-4">
+                              <span
+                                className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-extrabold ${
+                                  incident.incidentType === 'OUTSIDE_GEOFENCE'
+                                    ? 'bg-rose-100 text-rose-800 border border-rose-200'
+                                    : incident.incidentType === 'INVALID_QR_CHALLENGE'
+                                    ? 'bg-amber-100 text-amber-800 border border-amber-200'
+                                    : incident.incidentType === 'INSUFFICIENT_LOCATION_ACCURACY'
+                                    ? 'bg-purple-100 text-purple-800 border border-purple-200'
+                                    : 'bg-slate-100 text-slate-800 border border-slate-200'
+                                }`}
+                              >
+                                {incident.incidentType}
+                              </span>
+                              {incident.details && (
+                                <p className="text-[10px] text-slate-500 mt-0.5 truncate max-w-xs">{incident.details}</p>
+                              )}
+                            </td>
+                            <td className="py-3 px-4 font-mono font-bold text-slate-800 whitespace-nowrap">
+                              {incident.distanceMeters !== null && incident.distanceMeters !== undefined ? (
+                                <span className={incident.distanceMeters > 100 ? 'text-rose-600' : 'text-slate-800'}>
+                                  {Math.round(incident.distanceMeters)}m from ASDC
+                                </span>
+                              ) : (
+                                <span className="text-slate-400">N/A</span>
+                              )}
+                            </td>
+                            <td className="py-3 px-4 font-mono text-slate-600 whitespace-nowrap">
+                              {incident.gpsAccuracy !== null && incident.gpsAccuracy !== undefined ? (
+                                `±${Math.round(incident.gpsAccuracy)}m`
+                              ) : (
+                                <span className="text-slate-400">—</span>
+                              )}
+                            </td>
+                            <td className="py-3 px-4 whitespace-nowrap">
+                              {incident.status === 'New' ? (
+                                <span className="px-2 py-0.5 rounded-full bg-rose-50 text-rose-700 border border-rose-200 font-extrabold text-[10px]">
+                                  New
+                                </span>
+                              ) : (
+                                <span className="px-2 py-0.5 rounded-full bg-slate-100 text-slate-600 border border-slate-200 font-bold text-[10px]">
+                                  Reviewed
+                                </span>
+                              )}
+                            </td>
+                            <td className="py-3 px-4 text-right whitespace-nowrap">
+                              {incident.status === 'New' ? (
+                                <button
+                                  type="button"
+                                  onClick={() => handleReviewIncident(incident.id)}
+                                  disabled={reviewingIncidentId === incident.id}
+                                  className="px-2.5 py-1 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-[11px] border border-slate-300 transition"
+                                >
+                                  {reviewingIncidentId === incident.id ? 'Reviewing...' : 'Mark Reviewed'}
+                                </button>
+                              ) : (
+                                <span className="text-[10px] text-slate-400 font-medium">Reviewed</span>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                    </tbody>
+                  </table>
+                )}
               </div>
             </div>
           </div>
@@ -1494,6 +2714,173 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                   className="flex-1 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg font-bold transition disabled:opacity-50 shadow-sm"
                 >
                   {correctionSubmitting ? 'Logging...' : 'Apply & Audit Log'}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* Master Finalize Daily Attendance Modal */}
+      {finalizingModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fadeIn">
+          <div className="w-full max-w-md bg-white border border-slate-200 rounded-2xl shadow-2xl p-6 relative">
+            <div className="flex items-center gap-2.5 mb-2 text-amber-600">
+              <CheckCheck className="w-6 h-6" />
+              <h3 className="text-base font-extrabold text-slate-950">
+                Finalize Daily Attendance
+              </h3>
+            </div>
+            <p className="text-xs text-slate-600 mb-4 font-medium">
+              You are about to officially close and finalize attendance for <strong className="font-mono text-slate-900 font-bold">{selectedDate}</strong> in the Master Excel Register.
+            </p>
+
+            <div className="bg-slate-50 border border-slate-200 rounded-xl p-4 space-y-2 text-xs mb-5">
+              <div className="flex justify-between">
+                <span className="text-slate-500 font-medium">Total Registered Students:</span>
+                <span className="font-bold text-slate-900">{masterInfo?.totalStudents || 24}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-emerald-700 font-medium">Present (Will remain &apos;P&apos;):</span>
+                <span className="font-bold text-emerald-700">{masterDailyData?.presentCount || 0}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-rose-700 font-medium">Unmarked (Will be marked &apos;A&apos;):</span>
+                <span className="font-bold text-rose-700">{masterDailyData?.unmarkedCount || 0}</span>
+              </div>
+              <div className="flex justify-between">
+                <span className="text-slate-500 font-medium">Already Confirmed Absent:</span>
+                <span className="font-bold text-slate-700">{masterDailyData?.absentCount || 0}</span>
+              </div>
+            </div>
+
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-900 text-xs mb-5 font-medium leading-relaxed">
+              <strong>Confirmation Rule:</strong> All unrecorded students on {selectedDate} will receive &apos;A&apos; (Absent). Existing &apos;P&apos; records and all previous dates will remain intact. This action is permanently logged under <strong>{adminEmail}</strong>.
+            </div>
+
+            <div className="flex gap-2">
+              <button
+                type="button"
+                onClick={() => setFinalizingModalOpen(false)}
+                className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-xl font-bold transition border border-slate-200 text-xs"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmFinalize}
+                disabled={finalizingSubmitting}
+                className="flex-1 py-2.5 bg-amber-600 hover:bg-amber-700 text-white rounded-xl font-bold transition disabled:opacity-50 shadow-sm text-xs flex items-center justify-center gap-1.5"
+              >
+                {finalizingSubmitting ? (
+                  <>
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    Finalizing...
+                  </>
+                ) : (
+                  `Finalize Attendance for ${selectedDate}`
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Master Excel Cell Correction Modal */}
+      {masterCorrectionModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm animate-fadeIn">
+          <div className="w-full max-w-md bg-white border border-slate-200 rounded-2xl shadow-2xl p-6 relative">
+            <h3 className="text-base font-bold text-slate-950 mb-1">
+              Correct Master Attendance Entry
+            </h3>
+            <p className="text-xs text-slate-600 mb-4 font-medium">
+              Student: <strong>{masterCorrectionModal.studentName}</strong> (Row {masterCorrectionModal.row}) • Date: <span className="font-mono text-emerald-800 font-bold">{masterCorrectionModal.date}</span> {masterCorrectionModal.cellRef ? `(Cell ${masterCorrectionModal.cellRef})` : ''}
+            </p>
+
+            <form onSubmit={handleConfirmMasterCorrection} className="space-y-4 text-xs">
+              <div>
+                <label className="block font-bold text-slate-700 mb-1.5">
+                  Select New Status *
+                </label>
+                <div className="grid grid-cols-4 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setMasterCorrectionStatus('P')}
+                    className={`py-2 rounded-lg font-bold transition text-xs ${
+                      masterCorrectionStatus === 'P'
+                        ? 'bg-emerald-600 text-white shadow-sm'
+                        : 'bg-slate-50 text-slate-700 border border-slate-200 hover:bg-slate-100'
+                    }`}
+                  >
+                    P (Present)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMasterCorrectionStatus('A')}
+                    className={`py-2 rounded-lg font-bold transition text-xs ${
+                      masterCorrectionStatus === 'A'
+                        ? 'bg-rose-600 text-white shadow-sm'
+                        : 'bg-slate-50 text-slate-700 border border-slate-200 hover:bg-slate-100'
+                    }`}
+                  >
+                    A (Absent)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMasterCorrectionStatus('L')}
+                    className={`py-2 rounded-lg font-bold transition text-xs ${
+                      masterCorrectionStatus === 'L'
+                        ? 'bg-amber-600 text-white shadow-sm'
+                        : 'bg-slate-50 text-slate-700 border border-slate-200 hover:bg-slate-100'
+                    }`}
+                  >
+                    L (Leave)
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setMasterCorrectionStatus('')}
+                    className={`py-2 rounded-lg font-bold transition text-xs ${
+                      masterCorrectionStatus === ''
+                        ? 'bg-slate-700 text-white shadow-sm'
+                        : 'bg-slate-50 text-slate-700 border border-slate-200 hover:bg-slate-100'
+                    }`}
+                  >
+                    Clear (Empty)
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block font-bold text-slate-700 mb-1">
+                  Mandatory Audit Reason * (At least 5 characters)
+                </label>
+                <textarea
+                  required
+                  rows={3}
+                  placeholder="e.g. Verified presence on CCTV / Leave approved by teacher..."
+                  value={masterCorrectionReason}
+                  onChange={(e) => setMasterCorrectionReason(e.target.value)}
+                  className="w-full px-3 py-2 bg-white border border-slate-300 rounded-lg text-slate-900 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-emerald-500 font-medium"
+                />
+                <span className="text-[11px] text-slate-500 mt-1 block">
+                  Logged in permanent audit trail under {adminEmail}.
+                </span>
+              </div>
+
+              <div className="flex gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setMasterCorrectionModal(null)}
+                  className="flex-1 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-bold transition border border-slate-200"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={masterCorrectionSubmitting || masterCorrectionReason.trim().length < 5}
+                  className="flex-1 py-2.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg font-bold transition disabled:opacity-50 shadow-sm"
+                >
+                  {masterCorrectionSubmitting ? 'Updating...' : 'Save to Master Excel'}
                 </button>
               </div>
             </form>
