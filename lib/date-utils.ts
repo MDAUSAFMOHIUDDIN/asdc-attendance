@@ -3,7 +3,7 @@
  * All institute operations are strictly anchored to Asia/Kolkata (IST = UTC+05:30).
  */
 
-import { INSTITUTE_CONFIG } from './admin-config';
+import { INSTITUTE_CONFIG } from './admin-config.ts';
 
 export interface ISTTimeInfo {
   year: number;

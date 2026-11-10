@@ -441,14 +441,70 @@ export async function correctMasterAttendanceEntry(params: {
 
 /**
  * Trigger download of the official Master Excel Workbook snapshot
+ * Supports desktop and mobile browsers with robust blob handling and meaningful error feedback.
  */
-export function triggerMasterWorkbookDownload(adminEmail: string): void {
+export async function triggerMasterWorkbookDownload(adminEmail: string): Promise<void> {
   const url = `/api/attendance/master-excel/download?adminEmail=${encodeURIComponent(adminEmail)}&t=${Date.now()}`;
+  
+  const response = await fetch(url, {
+    method: 'GET',
+    headers: {
+      'Accept': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+    },
+  });
+
+  if (!response.ok) {
+    let errorMessage = `Download failed with status ${response.status} (${response.statusText})`;
+    try {
+      const errorJson = await response.json();
+      if (errorJson && errorJson.error) {
+        errorMessage = errorJson.error;
+      }
+    } catch {
+      // response wasn't JSON
+    }
+    throw new Error(errorMessage);
+  }
+
+  const contentType = response.headers.get('content-type') || '';
+  if (!contentType.includes('spreadsheetml') && !contentType.includes('octet-stream')) {
+    throw new Error(`Invalid file type received: ${contentType}. Expected XLSX spreadsheet.`);
+  }
+
+  const blob = await response.blob();
+  if (blob.size === 0) {
+    throw new Error('Downloaded file is empty (0 bytes).');
+  }
+
+  // Extract filename from Content-Disposition header if available
+  let filename = 'B-19-AI Builder (1) (3).xlsx';
+  const disposition = response.headers.get('content-disposition');
+  if (disposition) {
+    const filenameMatch = disposition.match(/filename\*?=(?:UTF-8'')?["']?([^"';]+)["']?/i);
+    if (filenameMatch && filenameMatch[1]) {
+      try {
+        filename = decodeURIComponent(filenameMatch[1]);
+      } catch {
+        filename = filenameMatch[1];
+      }
+    }
+  }
+
+  // Create clean Blob and download for desktop and mobile compatibility
+  const downloadBlob = new Blob([blob], {
+    type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  });
+  const blobUrl = window.URL.createObjectURL(downloadBlob);
   const link = document.createElement('a');
-  link.href = url;
-  link.download = 'B-19-AI Builder (1) (3).xlsx';
+  link.href = blobUrl;
+  link.setAttribute('download', filename);
   document.body.appendChild(link);
   link.click();
-  document.body.removeChild(link);
+
+  // Safely clean up
+  setTimeout(() => {
+    document.body.removeChild(link);
+    window.URL.revokeObjectURL(blobUrl);
+  }, 1000);
 }
 

@@ -50,6 +50,15 @@ import {
   correctMasterAttendanceEntry,
   triggerMasterWorkbookDownload,
 } from '@/lib/attendance-service';
+import { db } from '@/lib/firebase';
+import {
+  collection,
+  query,
+  orderBy,
+  onSnapshot,
+  doc,
+  updateDoc,
+} from 'firebase/firestore';
 import {
   StudentProfile,
   AttendanceRecord,
@@ -63,6 +72,7 @@ import {
   ActiveQRChallenge,
   GeofenceConfig,
   LocationIncident,
+  QRAccessStatus,
 } from '@/lib/types';
 import {
   getISTTimeInfo,
@@ -141,13 +151,15 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
   });
   const [qrDataUrl, setQrDataUrl] = useState<string>('');
 
-  // Feature 1: QR Challenge State
+  // Feature 1: Permanent Classroom QR & Admin Access ON/OFF Control
   const [activeQRChallenge, setActiveQRChallenge] = useState<ActiveQRChallenge | null>(null);
-  const [qrHistory, setQrHistory] = useState<any[]>([]);
-  const [isRefreshingQR, setIsRefreshingQR] = useState<boolean>(false);
-  const [showRefreshModal, setShowRefreshModal] = useState<boolean>(false);
+  const [qrAccessStatus, setQrAccessStatus] = useState<QRAccessStatus>('ENABLED');
+  const [isTogglingQRAccess, setIsTogglingQRAccess] = useState<boolean>(false);
   const [qrSuccessMessage, setQrSuccessMessage] = useState<string | null>(null);
   const [qrErrorMessage, setQrErrorMessage] = useState<string | null>(null);
+
+  // File Download State
+  const [downloadingExcel, setDownloadingExcel] = useState<boolean>(false);
 
   // Feature 2: Geofence Configuration State
   const [geofenceConfig, setGeofenceConfig] = useState<GeofenceConfig | null>(null);
@@ -202,37 +214,33 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
       if (data.success) {
         if (data.challenge) setActiveQRChallenge(data.challenge);
         if (data.qrDataUrl) setQrDataUrl(data.qrDataUrl);
-        if (data.history) setQrHistory(data.history);
+        if (data.qrAccessStatus) setQrAccessStatus(data.qrAccessStatus);
       }
     } catch (err) {
       console.error('Failed to load active QR:', err);
     }
   }, [adminEmail]);
 
-  const handleRefreshQR = async () => {
+  const handleToggleQRAccess = async (newStatus: QRAccessStatus) => {
     try {
-      setIsRefreshingQR(true);
+      setIsTogglingQRAccess(true);
       setQrErrorMessage(null);
-      const res = await fetch('/api/attendance/qr/refresh', {
+      const res = await fetch('/api/attendance/qr/toggle', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ adminEmail }),
+        body: JSON.stringify({ adminEmail, status: newStatus }),
       });
       const data = await res.json();
       if (!res.ok) {
-        throw new Error(data.error || 'Failed to refresh QR');
+        throw new Error(data.error || 'Failed to update QR access state.');
       }
-      setActiveQRChallenge(data.challenge);
-      setQrDataUrl(data.qrDataUrl);
-      if (data.history) setQrHistory(data.history);
-      setShowRefreshModal(false);
-      setQrSuccessMessage('Classroom QR successfully refreshed! Previous QR code invalidated immediately.');
-      setTimeout(() => setQrSuccessMessage(null), 6000);
-      loadLocationIncidents();
+      setQrAccessStatus(newStatus);
+      setQrSuccessMessage(`Classroom QR Access successfully ${newStatus}!`);
+      setTimeout(() => setQrSuccessMessage(null), 5000);
     } catch (err: any) {
-      setQrErrorMessage(err.message || 'Error refreshing QR code');
+      setQrErrorMessage(err.message || 'Error updating QR access');
     } finally {
-      setIsRefreshingQR(false);
+      setIsTogglingQRAccess(false);
     }
   };
 
@@ -295,6 +303,28 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
   const handleReviewIncident = async (incidentId: string) => {
     try {
       setReviewingIncidentId(incidentId);
+
+      // Optimistic update
+      setLocationIncidents((prev) =>
+        prev.map((inc) =>
+          inc.id === incidentId
+            ? { ...inc, status: 'Reviewed', reviewedAt: new Date().toISOString(), reviewedBy: adminEmail }
+            : inc
+        )
+      );
+
+      // Direct Firestore update
+      try {
+        const docRef = doc(db, 'location_incidents', incidentId);
+        await updateDoc(docRef, {
+          status: 'Reviewed',
+          reviewedAt: new Date().toISOString(),
+          reviewedBy: adminEmail,
+        });
+      } catch (fsErr) {
+        console.warn('Firestore direct review update note:', fsErr);
+      }
+
       const res = await fetch('/api/attendance/incidents', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -310,6 +340,65 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
       setReviewingIncidentId(null);
     }
   };
+
+  // Real-Time Database Listener: Location Security Alerts
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    try {
+      const q = query(
+        collection(db, 'location_incidents'),
+        orderBy('timestamp', 'desc')
+      );
+      unsubscribe = onSnapshot(
+        q,
+        (snapshot) => {
+          const items: LocationIncident[] = [];
+          snapshot.forEach((docSnap) => {
+            items.push({ id: docSnap.id, ...docSnap.data() } as LocationIncident);
+          });
+          setLocationIncidents(items);
+          setIsLoadingIncidents(false);
+        },
+        (error) => {
+          console.warn('Real-time incidents listener fallback to polling:', error);
+          loadLocationIncidents();
+        }
+      );
+    } catch (err) {
+      console.warn('Could not initialize real-time listener:', err);
+      loadLocationIncidents();
+    }
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [adminEmail, loadLocationIncidents]);
+
+  // Real-Time Database Listener: Classroom QR Access ON/OFF state
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    try {
+      const docRef = doc(db, 'settings', 'qr_access');
+      unsubscribe = onSnapshot(
+        docRef,
+        (snap) => {
+          if (snap.exists()) {
+            const data = snap.data();
+            if (data?.status === 'ENABLED' || data?.status === 'DISABLED') {
+              setQrAccessStatus(data.status);
+            }
+          }
+        },
+        (err) => console.warn('QR access listener note:', err)
+      );
+    } catch (err) {
+      console.warn('Could not initialize QR access listener:', err);
+    }
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
 
   useEffect(() => {
     loadActiveQR();
@@ -412,8 +501,26 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
   }, [selectedDate, loadMasterData]);
 
   // Master Workbook Handlers
-  const handleDownloadMasterExcel = () => {
-    triggerMasterWorkbookDownload(adminEmail);
+  const handleDownloadMasterExcel = async () => {
+    try {
+      setDownloadingExcel(true);
+      setMasterFeedback(null);
+      await triggerMasterWorkbookDownload(adminEmail);
+      setMasterFeedback({
+        type: 'success',
+        message: 'Master Excel register (B-19-AI Builder (1) (3).xlsx) downloaded successfully.',
+      });
+    } catch (err: any) {
+      console.error('Master Excel download error:', err);
+      const msg = err?.message || 'Failed to download master Excel workbook.';
+      setMasterFeedback({
+        type: 'error',
+        message: msg,
+      });
+      alert(msg);
+    } finally {
+      setDownloadingExcel(false);
+    }
   };
 
   const handleConfirmFinalize = async () => {
@@ -689,14 +796,18 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
     });
 
     const csvContent = [headers.join(','), ...rows.map((r) => r.join(','))].join('\n');
-    const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
+    // Prepend UTF-8 BOM (\uFEFF) for 100% correct encoding in Microsoft Excel
+    const blob = new Blob(['\uFEFF' + csvContent], { type: 'text/csv;charset=utf-8;' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
     link.href = url;
     link.setAttribute('download', `ASDC_Attendance_${selectedDate}.csv`);
     document.body.appendChild(link);
     link.click();
-    document.body.removeChild(link);
+    setTimeout(() => {
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+    }, 1000);
   };
 
   // Run Boundary Tests
@@ -1562,58 +1673,6 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
         {/* ===================== TAB 3: QR CODE & GEOFENCE SECURITY ===================== */}
         {activeTab === 'qr' && (
           <div className="space-y-8 max-w-5xl mx-auto">
-            {/* Refresh Confirmation Modal */}
-            {showRefreshModal && (
-              <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/70 backdrop-blur-sm animate-fadeIn">
-                <div className="w-full max-w-md bg-white border border-slate-200 rounded-3xl p-6 shadow-2xl space-y-4">
-                  <div className="flex items-center gap-3">
-                    <div className="p-3 bg-amber-50 text-amber-600 rounded-2xl border border-amber-200">
-                      <AlertTriangle className="w-6 h-6" />
-                    </div>
-                    <div>
-                      <h3 className="text-base font-extrabold text-slate-950">Refresh Classroom QR Code?</h3>
-                      <p className="text-xs text-slate-500 font-medium">Immediate invalidation of existing codes</p>
-                    </div>
-                  </div>
-
-                  <div className="p-3.5 bg-amber-50/70 border border-amber-200 rounded-xl text-xs text-amber-900 leading-relaxed font-medium space-y-1.5">
-                    <p>• Generating a new QR code will <strong>IMMEDIATELY invalidate</strong> the current QR code on the backend.</p>
-                    <p>• Any previous QR codes, screenshots, or saved images will fail validation instantly.</p>
-                    <p>• Students must scan the newly generated QR code to mark attendance.</p>
-                  </div>
-
-                  <div className="flex items-center justify-end gap-2.5 pt-2">
-                    <button
-                      type="button"
-                      onClick={() => setShowRefreshModal(false)}
-                      disabled={isRefreshingQR}
-                      className="px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-100 font-bold text-xs transition"
-                    >
-                      Cancel
-                    </button>
-                    <button
-                      type="button"
-                      onClick={handleRefreshQR}
-                      disabled={isRefreshingQR}
-                      className="px-5 py-2.5 rounded-xl bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs flex items-center gap-2 shadow-md transition disabled:opacity-50"
-                    >
-                      {isRefreshingQR ? (
-                        <>
-                          <RefreshCw className="w-4 h-4 animate-spin" />
-                          Generating New Token...
-                        </>
-                      ) : (
-                        <>
-                          <RefreshCw className="w-4 h-4" />
-                          Confirm & Invalidate Previous QR
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              </div>
-            )}
-
             {/* Success & Error Banners */}
             {qrSuccessMessage && (
               <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-2xl flex items-center gap-3 text-emerald-900 text-xs font-semibold animate-fadeIn shadow-sm">
@@ -1628,7 +1687,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
               </div>
             )}
 
-            {/* 1. ADMIN QR CODE MANAGEMENT */}
+            {/* 1. ADMIN CLASSROOM QR ACCESS & PERMANENT QR CODE */}
             <div className="bg-white border border-slate-200 rounded-2xl shadow-sm overflow-hidden">
               <div className="p-5 sm:p-6 border-b border-slate-200 bg-slate-50 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div className="flex items-center gap-3">
@@ -1638,101 +1697,108 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                   <div>
                     <h3 className="text-base font-extrabold text-slate-950">Classroom Attendance QR Code</h3>
                     <p className="text-xs text-slate-500 font-medium">
-                      Cryptographically protected token • Authorized Admin: {SOLE_ADMIN_EMAIL}
+                      One permanent ASDC QR code • Controlled by Administrator ON/OFF access switch
                     </p>
                   </div>
                 </div>
 
-                <div className="flex items-center gap-2.5">
+                {/* Prominent CLASSROOM QR ACCESS Controls */}
+                <div className="flex items-center gap-2">
                   <button
                     type="button"
-                    onClick={() => setShowRefreshModal(true)}
-                    className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded-xl flex items-center gap-2 shadow-sm transition"
+                    onClick={() => handleToggleQRAccess('ENABLED')}
+                    disabled={isTogglingQRAccess || qrAccessStatus === 'ENABLED'}
+                    className={`px-4 py-2.5 rounded-xl font-black text-xs flex items-center gap-2 transition shadow-sm ${
+                      qrAccessStatus === 'ENABLED'
+                        ? 'bg-emerald-600 text-white cursor-default opacity-90'
+                        : 'bg-emerald-50 text-emerald-800 hover:bg-emerald-100 border border-emerald-300 cursor-pointer active:scale-95'
+                    }`}
                   >
-                    <RefreshCw className="w-3.5 h-3.5" />
-                    Refresh QR Code
+                    <CheckCircle className="w-4 h-4" />
+                    ENABLE QR ACCESS
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => handleToggleQRAccess('DISABLED')}
+                    disabled={isTogglingQRAccess || qrAccessStatus === 'DISABLED'}
+                    className={`px-4 py-2.5 rounded-xl font-black text-xs flex items-center gap-2 transition shadow-sm ${
+                      qrAccessStatus === 'DISABLED'
+                        ? 'bg-rose-600 text-white cursor-default opacity-90'
+                        : 'bg-rose-50 text-rose-800 hover:bg-rose-100 border border-rose-300 cursor-pointer active:scale-95'
+                    }`}
+                  >
+                    <XCircle className="w-4 h-4" />
+                    DISABLE QR ACCESS
                   </button>
                 </div>
               </div>
 
               <div className="p-6 grid grid-cols-1 lg:grid-cols-12 gap-8 items-start">
-                {/* QR Status & Info Column */}
+                {/* QR Access Status & Info Column */}
                 <div className="lg:col-span-6 space-y-4">
-                  {/* Status Badges */}
-                  <div className="grid grid-cols-2 gap-3">
-                    <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl">
-                      <span className="text-[11px] font-bold text-slate-500 block">QR Status</span>
-                      <div className="flex items-center gap-1.5 mt-1">
-                        <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-                        <span className="font-extrabold text-xs text-emerald-700">
-                          {activeQRChallenge?.status || 'ACTIVE'}
-                        </span>
-                      </div>
-                    </div>
-                    <div className="p-3.5 bg-slate-50 border border-slate-200 rounded-xl">
-                      <span className="text-[11px] font-bold text-slate-500 block">Last Refreshed</span>
-                      <span className="font-mono font-bold text-xs text-slate-800 mt-1 block">
-                        {activeQRChallenge?.generatedAt
-                          ? formatDisplayTimestamp(activeQRChallenge.generatedAt)
-                          : 'Initial System Token'}
+                  {/* Dedicated CLASSROOM QR ACCESS Status Card */}
+                  <div
+                    className={`p-5 rounded-2xl border-2 transition ${
+                      qrAccessStatus === 'ENABLED'
+                        ? 'bg-emerald-50/90 border-emerald-500 text-emerald-950 shadow-sm'
+                        : 'bg-rose-50/90 border-rose-500 text-rose-950 shadow-sm'
+                    }`}
+                  >
+                    <div className="flex items-center justify-between mb-2">
+                      <span className="text-[11px] font-black uppercase tracking-wider text-slate-700">
+                        CLASSROOM QR ACCESS
+                      </span>
+                      <span
+                        className={`px-3 py-1 rounded-full text-xs font-black tracking-wider flex items-center gap-1.5 shadow-sm ${
+                          qrAccessStatus === 'ENABLED'
+                            ? 'bg-emerald-600 text-white'
+                            : 'bg-rose-600 text-white'
+                        }`}
+                      >
+                        <span
+                          className={`w-2.5 h-2.5 rounded-full ${
+                            qrAccessStatus === 'ENABLED' ? 'bg-white animate-pulse' : 'bg-white'
+                          }`}
+                        />
+                        {qrAccessStatus}
                       </span>
                     </div>
+                    <p className="text-xs font-semibold leading-relaxed">
+                      {qrAccessStatus === 'ENABLED'
+                        ? 'Attendance submissions are currently ENABLED. Authenticated students within the 100m ASDC campus radius can scan the permanent classroom QR to mark attendance.'
+                        : 'Attendance is currently DISABLED by the administrator. Any student scan attempt will be safely rejected on the backend without recording attendance.'}
+                    </p>
                   </div>
 
-                  {/* Active Token Chip */}
+                  {/* Permanent QR Static Token Box */}
                   <div className="p-4 bg-slate-900 text-slate-100 rounded-xl border border-slate-800 space-y-2">
                     <div className="flex items-center justify-between">
-                      <span className="text-[11px] font-mono text-amber-400 font-bold uppercase tracking-wider flex items-center gap-1.5">
-                        <Radio className="w-3.5 h-3.5 animate-pulse" />
-                        Active Challenge Token
+                      <span className="text-[11px] font-mono text-emerald-400 font-bold uppercase tracking-wider flex items-center gap-1.5">
+                        <Shield className="w-3.5 h-3.5 text-emerald-400" />
+                        Permanent Classroom QR Code
                       </span>
                       <span className="text-[10px] bg-slate-800 text-slate-300 px-2 py-0.5 rounded-full font-mono">
-                        Opaque UUID
+                        NO Expiration
                       </span>
                     </div>
                     <p className="font-mono text-xs break-all text-emerald-400 font-bold bg-slate-950 p-2.5 rounded-lg border border-slate-800">
-                      {activeQRChallenge?.challengeId || 'Loading active token...'}
+                      ASDC_PERMANENT_CLASSROOM_QR
                     </p>
                     <p className="text-[11px] text-slate-400">
-                      Generated by: <strong className="text-slate-200">{activeQRChallenge?.generatedBy || SOLE_ADMIN_EMAIL}</strong>
+                      Institute: <strong className="text-slate-200">{INSTITUTE_CONFIG.INSTITUTE_NAME}</strong> • Authorized Admin:{' '}
+                      <strong className="text-slate-200">{SOLE_ADMIN_EMAIL}</strong>
                     </p>
                   </div>
 
-                  {/* Security Note */}
-                  <div className="p-4 bg-blue-50/70 border border-blue-200 rounded-xl text-xs text-blue-900 space-y-1 font-medium">
+                  {/* Operational Guide */}
+                  <div className="p-4 bg-blue-50/70 border border-blue-200 rounded-xl text-xs text-blue-900 space-y-1.5 font-medium">
                     <p className="font-extrabold text-blue-950 flex items-center gap-1.5">
-                      <Shield className="w-3.5 h-3.5 text-blue-600" /> Invalidation Protection
+                      <Info className="w-3.5 h-3.5 text-blue-600" /> Permanent QR & Access Behavior
                     </p>
-                    <p>• Whenever you click &quot;Refresh QR Code&quot;, any previously displayed QR is immediately revoked.</p>
-                    <p>• Students who saved screenshots or photos of previous QR codes will receive an immediate rejection.</p>
-                    <p>• All refreshes are securely logged with admin attribution.</p>
+                    <p>• <strong>One Permanent QR:</strong> The physical QR image never changes and never expires. Mount it in the classroom once.</p>
+                    <p>• <strong>When DISABLED:</strong> Backend rejects all attendance requests immediately with: <em>&quot;Attendance is currently disabled by the administrator. Please wait until the administrator enables attendance.&quot;</em></p>
+                    <p>• <strong>When ENABLED:</strong> Exact same permanent QR code accepts attendance immediately upon backend validation.</p>
                   </div>
-
-                  {/* QR History Table (Recent Refreshes) */}
-                  {qrHistory && qrHistory.length > 1 && (
-                    <div className="border border-slate-200 rounded-xl overflow-hidden">
-                      <div className="p-3 bg-slate-50 border-b border-slate-200 text-xs font-extrabold text-slate-800 flex items-center justify-between">
-                        <span>QR Refresh Audit Log ({qrHistory.length - 1} previous)</span>
-                      </div>
-                      <div className="max-h-40 overflow-y-auto divide-y divide-slate-100 text-[11px]">
-                        {qrHistory.slice(1, 6).map((item, idx) => (
-                          <div key={idx} className="p-2.5 flex items-center justify-between hover:bg-slate-50">
-                            <div>
-                              <span className="font-mono text-slate-700 font-bold block truncate w-48">
-                                {item.challengeId}
-                              </span>
-                              <span className="text-[10px] text-slate-500">
-                                Invalidated: {item.invalidatedAt ? formatDisplayTimestamp(item.invalidatedAt) : 'Replaced'}
-                              </span>
-                            </div>
-                            <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-slate-100 text-slate-600 border border-slate-200">
-                              INVALIDATED
-                            </span>
-                          </div>
-                        ))}
-                      </div>
-                    </div>
-                  )}
                 </div>
 
                 {/* Printable Card Area */}
@@ -1758,7 +1824,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                         {/* eslint-disable-next-line @next/next/no-img-element */}
                         <img
                           src={qrDataUrl}
-                          alt="ASDC Classroom Attendance QR Code"
+                          alt="ASDC Permanent Classroom Attendance QR Code"
                           className="w-52 h-52 object-contain"
                         />
                       </div>
@@ -1769,11 +1835,19 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                     )}
 
                     <div className="mt-3 text-center">
-                      <span className="inline-block px-3 py-0.5 bg-emerald-50 border border-emerald-200 text-emerald-800 text-[11px] font-bold rounded-lg mb-1">
-                        Live Active QR
+                      <span
+                        className={`inline-block px-3 py-1 text-[11px] font-black rounded-lg mb-1 shadow-sm ${
+                          qrAccessStatus === 'ENABLED'
+                            ? 'bg-emerald-100 border border-emerald-300 text-emerald-900'
+                            : 'bg-rose-100 border border-rose-300 text-rose-900'
+                        }`}
+                      >
+                        {qrAccessStatus === 'ENABLED'
+                          ? 'Classroom QR: ENABLED'
+                          : 'Classroom QR: DISABLED'}
                       </span>
                       <p className="text-[10px] text-slate-500 font-mono break-all leading-tight">
-                        Token: {activeQRChallenge?.challengeId ? `${activeQRChallenge.challengeId.slice(0, 16)}...` : 'Connecting...'}
+                        Permanent Original ASDC Classroom QR
                       </p>
                     </div>
                   </div>
@@ -1781,6 +1855,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                   {/* Print & Download Buttons */}
                   <div className="flex flex-wrap items-center justify-center gap-2.5 mt-4">
                     <button
+                      type="button"
                       onClick={() => window.print()}
                       className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 shadow-sm transition"
                     >
@@ -1790,7 +1865,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                     {qrDataUrl && (
                       <a
                         href={qrDataUrl}
-                        download={`ASDC_Classroom_QR_${activeQRChallenge?.challengeId?.slice(0, 8) || 'active'}.png`}
+                        download="ASDC_Permanent_Classroom_QR.png"
                         className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 border border-slate-200 font-bold text-xs rounded-xl flex items-center gap-1.5 transition"
                       >
                         <Download className="w-3.5 h-3.5" />

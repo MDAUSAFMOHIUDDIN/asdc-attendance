@@ -1,7 +1,7 @@
 import { initializeApp, getApps, getApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider } from 'firebase/auth';
 import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
-import firebaseConfig from '../firebase-applet-config.json';
+import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
 
 const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 
@@ -16,14 +16,16 @@ googleProvider.setCustomParameters({
   prompt: 'select_account',
 });
 
-export enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
-}
+export const OperationType = {
+  CREATE: 'create',
+  UPDATE: 'update',
+  DELETE: 'delete',
+  LIST: 'list',
+  GET: 'get',
+  WRITE: 'write',
+} as const;
+
+export type OperationType = typeof OperationType[keyof typeof OperationType];
 
 export interface FirestoreErrorInfo {
   error: string;

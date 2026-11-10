@@ -5,7 +5,7 @@ import { db } from '@/lib/firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { AttendanceRecord, ClassroomQRPayload } from '@/lib/types';
 import { recordStudentAttendanceInMaster } from '@/lib/excel-master-service';
-import { validateQRChallenge } from '@/lib/qr-challenge-service';
+import { getQRAccessStatus } from '@/lib/qr-challenge-service';
 import { verifyStudentLocation, logLocationIncident } from '@/lib/geofence-service';
 
 export async function POST(request: NextRequest) {
@@ -29,12 +29,25 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 2. Authoritative Date in Asia/Kolkata (Anytime attendance allowed)
+    // 2. CRITICAL BACKEND RULE: Check Admin QR Access ON/OFF status first
+    const qrAccessStatus = await getQRAccessStatus();
+    if (qrAccessStatus === 'DISABLED') {
+      return NextResponse.json(
+        {
+          error: 'Attendance is currently disabled by the administrator. Please wait until the administrator enables attendance.',
+          errorType: 'QR_ACCESS_DISABLED',
+          isQrDisabled: true,
+        },
+        { status: 403 }
+      );
+    }
+
+    // 3. Authoritative Date in Asia/Kolkata (Anytime attendance allowed)
     const evaluationTime = new Date();
     const istInfo = getISTTimeInfo(evaluationTime);
     const classDate = istInfo.dateString; // YYYY-MM-DD
 
-    // 3. QR Payload parsing & structure verification
+    // 4. Permanent QR Payload parsing & structure verification
     let qrData: ClassroomQRPayload;
     try {
       qrData = typeof rawQrContent === 'string' ? JSON.parse(rawQrContent) : rawQrContent;
@@ -51,12 +64,12 @@ export async function POST(request: NextRequest) {
       qrData.classroomId !== INSTITUTE_CONFIG.CLASSROOM_SECRET_KEY
     ) {
       return NextResponse.json(
-        { error: 'Invalid Classroom QR. Scanned QR code does not match ASDC AI Builder Mastery classroom.' },
+        { error: 'Invalid Classroom QR. Scanned QR code does not match official ASDC AI Builder Mastery classroom.' },
         { status: 400 }
       );
     }
 
-    // 4. Batch restriction check
+    // 5. Batch restriction check
     if (
       qrData.batchId !== INSTITUTE_CONFIG.DEFAULT_BATCH_ID ||
       batchId !== INSTITUTE_CONFIG.DEFAULT_BATCH_ID
@@ -69,48 +82,26 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 5. Authoritative Backend Validation of Active QR Challenge
-    const challengeValidation = validateQRChallenge(qrData.challengeId);
-    if (!challengeValidation.isValid) {
-      // Log incident: Invalid / Expired QR challenge
-      logLocationIncident({
-        studentId,
-        studentName,
-        studentEmail,
-        incidentType: 'INVALID_QR_CHALLENGE',
-        challengeId: qrData.challengeId || null,
-        latitude: location?.latitude ?? null,
-        longitude: location?.longitude ?? null,
-        gpsAccuracy: location?.accuracy ?? null,
-        details: challengeValidation.reason || 'Invalid or expired QR challenge submitted.',
-      });
-
-      return NextResponse.json(
-        {
-          error: challengeValidation.reason || 'Invalid or expired QR code. Please scan the current active classroom QR.',
-          isExpiredChallenge: true,
-        },
-        { status: 400 }
-      );
-    }
-
-    // 6. Authoritative Backend Geofence Verification
+    // 6. Authoritative Backend Geofence Verification (100m permitted radius, max 50m GPS accuracy)
     const locResult = verifyStudentLocation(location);
     if (!locResult.isValid) {
-      // Log location security incident
-      logLocationIncident({
-        studentId,
-        studentName,
-        studentEmail,
-        incidentType: locResult.errorType || 'OUTSIDE_GEOFENCE',
-        challengeId: qrData.challengeId || null,
-        latitude: location?.latitude ?? null,
-        longitude: location?.longitude ?? null,
-        gpsAccuracy: location?.accuracy ?? null,
-        distanceMeters: locResult.distanceMeters > 0 ? locResult.distanceMeters : null,
-        allowedRadiusMeters: locResult.config.radiusMeters,
-        details: locResult.message,
-      });
+      // Record genuine incident in backend database with safe retry handling
+      try {
+        await logLocationIncident({
+          studentId,
+          studentName,
+          studentEmail,
+          incidentType: locResult.errorType || 'OUTSIDE_GEOFENCE',
+          latitude: location?.latitude ?? null,
+          longitude: location?.longitude ?? null,
+          gpsAccuracy: location?.accuracy ?? null,
+          distanceMeters: locResult.distanceMeters > 0 ? locResult.distanceMeters : null,
+          allowedRadiusMeters: locResult.config.radiusMeters,
+          details: locResult.message,
+        });
+      } catch (logErr) {
+        console.error('[Submit] Failed to record security incident in database:', logErr);
+      }
 
       return NextResponse.json(
         {
@@ -205,7 +196,6 @@ export async function POST(request: NextRequest) {
     try {
       await setDoc(attendanceRef, {
         ...newRecord,
-        challengeId: qrData.challengeId,
         location: {
           latitude: location.latitude,
           longitude: location.longitude,

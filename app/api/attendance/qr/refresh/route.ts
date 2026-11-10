@@ -9,7 +9,7 @@ export async function POST(request: NextRequest) {
 
     if (!adminEmail || !isAuthorizedAdmin(adminEmail)) {
       return NextResponse.json(
-        { error: 'Unauthorized: Only administrator (mdausafmohiuddin@gmail.com) can refresh classroom QR.' },
+        { error: 'Unauthorized: Only administrator (mdausafmohiuddin@gmail.com) can manage classroom QR.' },
         { status: 403 }
       );
     }
@@ -18,13 +18,12 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      message: 'New classroom QR challenge generated and activated. Previous QR code invalidated immediately.',
       ...refreshResult,
     });
   } catch (error) {
-    console.error('Error refreshing QR challenge:', error);
+    console.error('Error fetching QR:', error);
     return NextResponse.json(
-      { error: error instanceof Error ? error.message : 'Failed to refresh QR challenge.' },
+      { error: error instanceof Error ? error.message : 'Failed to retrieve permanent QR.' },
       { status: 500 }
     );
   }

@@ -1,8 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { SOLE_ADMIN_EMAIL, isAuthorizedAdmin } from './admin-config';
-import { GeofenceConfig, LocationIncident, LocationIncidentType } from './types';
+import { SOLE_ADMIN_EMAIL, isAuthorizedAdmin } from './admin-config.ts';
+import type { GeofenceConfig, LocationIncident, LocationIncidentType } from './types.ts';
+import { getISTTimeInfo } from './date-utils.ts';
+import { db } from './firebase.ts';
+import { doc, getDoc, setDoc, getDocs, collection, query, orderBy, limit, updateDoc } from 'firebase/firestore';
 
 export const OFFICIAL_ASDC_LOCATION = {
   name: 'Advanced Skills Development Center (ASDC)',
@@ -19,8 +22,12 @@ const GEOFENCE_CONFIG_FILE = path.join(DATA_DIR, 'geofence-config.json');
 const INCIDENTS_FILE = path.join(DATA_DIR, 'location-incidents.json');
 
 function ensureDataDir(): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+  } catch {
+    // In serverless read-only environments, ignore mkdir errors
   }
 }
 
@@ -78,7 +85,7 @@ export function getGeofenceConfig(): GeofenceConfig {
   try {
     fs.writeFileSync(GEOFENCE_CONFIG_FILE, JSON.stringify(defaultConfig, null, 2), 'utf-8');
   } catch (err) {
-    console.error('[Geofence Service] Failed to save default geofence configuration:', err);
+    // Read-only filesystem warning
   }
 
   return defaultConfig;
@@ -112,7 +119,11 @@ export function updateGeofenceConfig(
   };
 
   ensureDataDir();
-  fs.writeFileSync(GEOFENCE_CONFIG_FILE, JSON.stringify(updated, null, 2), 'utf-8');
+  try {
+    fs.writeFileSync(GEOFENCE_CONFIG_FILE, JSON.stringify(updated, null, 2), 'utf-8');
+  } catch {
+    // Read-only filesystem
+  }
   return updated;
 }
 
@@ -126,6 +137,8 @@ export interface LocationVerificationResult {
 
 /**
  * Authoritative Backend Verification of Student Location
+ * Rejects outside ASDC radius (100m) or poor GPS accuracy (>50m).
+ * Prevents client-side manipulation.
  */
 export function verifyStudentLocation(coords?: {
   latitude?: number | null;
@@ -152,7 +165,7 @@ export function verifyStudentLocation(coords?: {
 
   const accuracy = typeof coords.accuracy === 'number' && !isNaN(coords.accuracy) ? coords.accuracy : 999;
 
-  // 1. Accuracy check: prevent gross inaccuracies / spoofed or coarse IP fallbacks
+  // 1. Accuracy check: prevent gross inaccuracies / coarse IP fallbacks
   if (accuracy > config.maxAccuracyMeters) {
     return {
       isValid: false,
@@ -163,7 +176,7 @@ export function verifyStudentLocation(coords?: {
     };
   }
 
-  // 2. Geodesic distance calculation
+  // 2. Geodesic distance calculation via Haversine formula
   const distanceMeters = calculateHaversineDistance(
     config.latitude,
     config.longitude,
@@ -171,7 +184,7 @@ export function verifyStudentLocation(coords?: {
     coords.longitude
   );
 
-  // 3. Radius check
+  // 3. Permitted Radius check (100 meters)
   if (distanceMeters > config.radiusMeters) {
     return {
       isValid: false,
@@ -179,7 +192,7 @@ export function verifyStudentLocation(coords?: {
       errorType: 'OUTSIDE_GEOFENCE',
       message: `Outside Authorized ASDC Campus. You are approximately ${Math.round(
         distanceMeters
-      )} metres away from ASDC. Attendance can only be recorded while physically present at the institute (within ${
+      )} metres away from ASDC. Attendance can only be recorded while physically present at the institute campus (within ${
         config.radiusMeters
       }m).`,
       config,
@@ -194,54 +207,114 @@ export function verifyStudentLocation(coords?: {
 }
 
 /**
- * Logs a security or location incident for administrator review
+ * Logs a genuine security or location incident for administrator review.
+ * Records incident with student name, ID, date, time, distance, GPS accuracy, and incident type.
+ * Persists to Firestore database and local store with safe retry handling.
  */
-export function logLocationIncident(
+export async function logLocationIncident(
   incidentData: Omit<LocationIncident, 'id' | 'timestamp' | 'status'>
-): LocationIncident {
-  ensureDataDir();
+): Promise<LocationIncident> {
+  const now = new Date();
+  const istInfo = getISTTimeInfo(now);
 
   const incident: LocationIncident = {
     id: crypto.randomUUID(),
-    timestamp: new Date().toISOString(),
+    timestamp: now.toISOString(),
+    date: istInfo.dateString,
+    time: istInfo.timeString,
     status: 'New',
-    ...incidentData,
+    studentId: incidentData.studentId,
+    studentName: incidentData.studentName,
+    studentEmail: incidentData.studentEmail,
+    incidentType: incidentData.incidentType,
+    latitude: incidentData.latitude ?? null,
+    longitude: incidentData.longitude ?? null,
+    gpsAccuracy: incidentData.gpsAccuracy ?? null,
+    distanceMeters: incidentData.distanceMeters ?? null,
+    allowedRadiusMeters: incidentData.allowedRadiusMeters || 100,
+    details: incidentData.details || '',
+    challengeId: incidentData.challengeId || null,
   };
 
-  let incidents: LocationIncident[] = [];
-  if (fs.existsSync(INCIDENTS_FILE)) {
+  // 1. Safe retry handling for Firestore write
+  let firestoreSaved = false;
+  let retryCount = 0;
+  const maxRetries = 3;
+
+  while (!firestoreSaved && retryCount < maxRetries) {
     try {
-      incidents = JSON.parse(fs.readFileSync(INCIDENTS_FILE, 'utf-8'));
-      if (!Array.isArray(incidents)) incidents = [];
-    } catch {
-      incidents = [];
+      const docRef = doc(db, 'location_incidents', incident.id);
+      await setDoc(docRef, incident);
+      firestoreSaved = true;
+    } catch (fsErr) {
+      retryCount++;
+      console.warn(`[Geofence Service] Firestore write attempt ${retryCount} failed:`, fsErr);
+      if (retryCount < maxRetries) {
+        // Brief exponential backoff
+        await new Promise((res) => setTimeout(res, retryCount * 150));
+      }
     }
   }
 
-  incidents.unshift(incident);
-
-  // Keep last 300 incidents
-  if (incidents.length > 300) {
-    incidents = incidents.slice(0, 300);
-  }
-
+  // 2. Persist to local disk
+  ensureDataDir();
   try {
+    let incidents: LocationIncident[] = [];
+    if (fs.existsSync(INCIDENTS_FILE)) {
+      try {
+        incidents = JSON.parse(fs.readFileSync(INCIDENTS_FILE, 'utf-8'));
+        if (!Array.isArray(incidents)) incidents = [];
+      } catch {
+        incidents = [];
+      }
+    }
+
+    incidents.unshift(incident);
+
+    // Keep last 300 incidents in local file
+    if (incidents.length > 300) {
+      incidents = incidents.slice(0, 300);
+    }
+
     fs.writeFileSync(INCIDENTS_FILE, JSON.stringify(incidents, null, 2), 'utf-8');
   } catch (err) {
-    console.error('[Geofence Service] Failed to save incident log:', err);
+    // In read-only serverless environments, file write may be ignored if Firestore succeeded
+    if (!firestoreSaved) {
+      console.error('[Geofence Service] CRITICAL: Both Firestore and local storage failed to save incident log:', err);
+    }
   }
 
   return incident;
 }
 
 /**
- * Retrieves all location incidents (Admin only)
+ * Retrieves all genuine location incidents (Admin only)
  */
-export function getLocationIncidents(adminEmail: string): LocationIncident[] {
+export async function getLocationIncidents(adminEmail: string): Promise<LocationIncident[]> {
   if (!isAuthorizedAdmin(adminEmail)) {
     throw new Error('Unauthorized: Only administrator can view location incidents.');
   }
 
+  // 1. Try reading from Firestore collection location_incidents
+  try {
+    const q = query(
+      collection(db, 'location_incidents'),
+      orderBy('timestamp', 'desc'),
+      limit(200)
+    );
+    const snap = await getDocs(q);
+    if (!snap.empty) {
+      const firestoreIncidents: LocationIncident[] = [];
+      snap.forEach((d) => {
+        firestoreIncidents.push(d.data() as LocationIncident);
+      });
+      return firestoreIncidents;
+    }
+  } catch (err) {
+    console.warn('[Geofence Service] Could not fetch incidents from Firestore, reading local fallback:', err);
+  }
+
+  // 2. Fall back to local disk
   ensureDataDir();
   if (fs.existsSync(INCIDENTS_FILE)) {
     try {
@@ -257,11 +330,26 @@ export function getLocationIncidents(adminEmail: string): LocationIncident[] {
 /**
  * Marks an incident as reviewed (Admin only)
  */
-export function markIncidentReviewed(adminEmail: string, incidentId: string): LocationIncident[] {
+export async function markIncidentReviewed(adminEmail: string, incidentId: string): Promise<LocationIncident[]> {
   if (!isAuthorizedAdmin(adminEmail)) {
     throw new Error('Unauthorized: Only administrator can review location incidents.');
   }
 
+  const nowIso = new Date().toISOString();
+
+  // 1. Update Firestore
+  try {
+    const docRef = doc(db, 'location_incidents', incidentId);
+    await updateDoc(docRef, {
+      status: 'Reviewed',
+      reviewedAt: nowIso,
+      reviewedBy: adminEmail,
+    });
+  } catch (fsErr) {
+    console.warn('[Geofence Service] Firestore review update notice:', fsErr);
+  }
+
+  // 2. Update local disk
   ensureDataDir();
   let incidents: LocationIncident[] = [];
   if (fs.existsSync(INCIDENTS_FILE)) {
@@ -275,9 +363,13 @@ export function markIncidentReviewed(adminEmail: string, incidentId: string): Lo
   const idx = incidents.findIndex((item) => item.id === incidentId);
   if (idx >= 0) {
     incidents[idx].status = 'Reviewed';
-    incidents[idx].reviewedAt = new Date().toISOString();
+    incidents[idx].reviewedAt = nowIso;
     incidents[idx].reviewedBy = adminEmail;
-    fs.writeFileSync(INCIDENTS_FILE, JSON.stringify(incidents, null, 2), 'utf-8');
+    try {
+      fs.writeFileSync(INCIDENTS_FILE, JSON.stringify(incidents, null, 2), 'utf-8');
+    } catch {
+      // ignore in read-only serverless
+    }
   }
 
   return incidents;

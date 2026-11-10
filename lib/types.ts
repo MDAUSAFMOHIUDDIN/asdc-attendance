@@ -71,10 +71,14 @@ export interface ClassroomQRPayload {
   type: 'classroom_attendance';
   batchId: string;
   classroomId: string;
+  permanentId?: string;
+  institute?: string;
   challengeId?: string;
   appUrl?: string;
   generatedAt?: string;
 }
+
+export type QRAccessStatus = 'ENABLED' | 'DISABLED';
 
 export type LocationIncidentType =
   | 'OUTSIDE_GEOFENCE'
@@ -90,6 +94,8 @@ export interface LocationIncident {
   studentName: string;
   studentEmail: string;
   incidentType: LocationIncidentType;
+  date?: string;
+  time?: string;
   latitude?: number | null;
   longitude?: number | null;
   gpsAccuracy?: number | null;
@@ -116,7 +122,7 @@ export interface GeofenceConfig {
 
 export interface ActiveQRChallenge {
   challengeId: string;
-  status: 'ACTIVE' | 'INACTIVE';
+  status: 'ENABLED' | 'DISABLED' | 'ACTIVE' | 'INACTIVE';
   batchId: string;
   issuer: 'ASDC';
   classroomId: string;

@@ -1,272 +1,320 @@
 import fs from 'fs';
 import path from 'path';
-import crypto from 'crypto';
 import QRCode from 'qrcode';
-import { INSTITUTE_CONFIG, SOLE_ADMIN_EMAIL, isAuthorizedAdmin } from './admin-config';
-import { ActiveQRChallenge, ClassroomQRPayload } from './types';
+import { INSTITUTE_CONFIG, SOLE_ADMIN_EMAIL, isAuthorizedAdmin } from './admin-config.ts';
+import type { ActiveQRChallenge, ClassroomQRPayload, QRAccessStatus } from './types.ts';
+import { OFFICIAL_PERMANENT_QR_PAYLOAD, generateClassroomQRDataUrl } from './qr-generator.ts';
+import { db } from './firebase.ts';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
 
-export interface QRChallengeHistoryEntry {
-  challengeId: string;
-  status: 'ACTIVE' | 'INVALIDATED' | 'DEACTIVATED';
-  generatedAt: string;
-  generatedBy: string;
-  invalidatedAt?: string;
-}
-
-interface ActiveQRStore {
-  activeChallenge: ActiveQRChallenge;
-  history: QRChallengeHistoryEntry[];
-}
+/**
+ * ASDC Attendance - Permanent Classroom QR Service & Admin Access Controller
+ * 
+ * Rules:
+ * 1. ONE permanent, original classroom QR code for ASDC. NO regeneration, NO daily expiration.
+ * 2. Admin ON/OFF Control: ENABLE QR ACCESS / DISABLE QR ACCESS.
+ * 3. Status stored in Firestore ('settings/qr_access') and persisted to disk.
+ * 4. Only mdausafmohiuddin@gmail.com can change access status.
+ */
 
 const DATA_DIR = path.join(process.cwd(), 'data');
+const QR_ACCESS_FILE = path.join(DATA_DIR, 'qr-access.json');
 const ACTIVE_QR_FILE = path.join(DATA_DIR, 'active-qr.json');
 
 function ensureDataDir(): void {
-  if (!fs.existsSync(DATA_DIR)) {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
+  try {
+    if (!fs.existsSync(DATA_DIR)) {
+      fs.mkdirSync(DATA_DIR, { recursive: true });
+    }
+  } catch {
+    // In serverless read-only environments, ignore mkdir errors
   }
 }
 
-/**
- * Creates a brand new secure QR challenge object
- */
-function createChallengeRecord(adminEmail: string): ActiveQRChallenge {
-  const challengeId = crypto.randomUUID();
-  const generatedAt = new Date().toISOString();
-
-  const qrPayload: ClassroomQRPayload = {
-    issuer: 'ASDC',
-    type: 'classroom_attendance',
-    batchId: INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
-    classroomId: INSTITUTE_CONFIG.CLASSROOM_SECRET_KEY,
-    challengeId,
-    generatedAt,
-  };
-
-  return {
-    challengeId,
-    status: 'ACTIVE',
-    batchId: INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
-    issuer: 'ASDC',
-    classroomId: INSTITUTE_CONFIG.CLASSROOM_SECRET_KEY,
-    generatedAt,
-    generatedBy: adminEmail || SOLE_ADMIN_EMAIL,
-    qrPayload,
-  };
-}
+// In-memory cache for ultra-fast checks and serverless warm starts
+let inMemoryQRAccessStatus: QRAccessStatus = 'ENABLED';
+let lastStatusFetchedAt = 0;
 
 /**
- * Loads the QR challenge store from disk, or initializes default
+ * Authoritative Backend Query: Get current QR Access status (ENABLED | DISABLED)
  */
-export function loadQRStore(): ActiveQRStore {
+export async function getQRAccessStatus(): Promise<QRAccessStatus> {
+  const now = Date.now();
+  // Cache for 2 seconds to avoid excessive Firestore reads on rapid scans
+  if (now - lastStatusFetchedAt < 2000) {
+    return inMemoryQRAccessStatus;
+  }
+
+  // 1. Try reading from Firestore settings/qr_access
+  try {
+    const settingRef = doc(db, 'settings', 'qr_access');
+    const snap = await getDoc(settingRef);
+    if (snap.exists()) {
+      const data = snap.data();
+      if (data && (data.status === 'ENABLED' || data.status === 'DISABLED')) {
+        inMemoryQRAccessStatus = data.status;
+        lastStatusFetchedAt = now;
+        return inMemoryQRAccessStatus;
+      }
+    }
+  } catch (err) {
+    // Firestore read error or rules: fall back to local disk
+  }
+
+  // 2. Fall back to local file
   ensureDataDir();
+  if (fs.existsSync(QR_ACCESS_FILE)) {
+    try {
+      const raw = fs.readFileSync(QR_ACCESS_FILE, 'utf-8');
+      const parsed = JSON.parse(raw);
+      if (parsed?.status === 'ENABLED' || parsed?.status === 'DISABLED') {
+        inMemoryQRAccessStatus = parsed.status;
+        lastStatusFetchedAt = now;
+        return inMemoryQRAccessStatus;
+      }
+    } catch {
+      // Ignore parse error
+    }
+  }
 
+  // 3. Fall back to active-qr.json if present
   if (fs.existsSync(ACTIVE_QR_FILE)) {
     try {
       const raw = fs.readFileSync(ACTIVE_QR_FILE, 'utf-8');
-      const parsed: ActiveQRStore = JSON.parse(raw);
-      if (parsed && parsed.activeChallenge && parsed.activeChallenge.challengeId) {
-        return parsed;
+      const parsed = JSON.parse(raw);
+      if (parsed?.activeChallenge?.status === 'INACTIVE' || parsed?.status === 'DISABLED') {
+        inMemoryQRAccessStatus = 'DISABLED';
+      } else {
+        inMemoryQRAccessStatus = 'ENABLED';
       }
-    } catch (err) {
-      console.warn('[QR Challenge Service] Error reading active-qr.json, re-initializing:', err);
+      lastStatusFetchedAt = now;
+      return inMemoryQRAccessStatus;
+    } catch {
+      // Ignore parse error
     }
   }
 
-  // Initialize new default store
-  const initialChallenge = createChallengeRecord(SOLE_ADMIN_EMAIL);
-  const initialStore: ActiveQRStore = {
-    activeChallenge: initialChallenge,
-    history: [
-      {
-        challengeId: initialChallenge.challengeId,
-        status: 'ACTIVE',
-        generatedAt: initialChallenge.generatedAt,
-        generatedBy: initialChallenge.generatedBy,
-      },
-    ],
-  };
+  // Default initial status is ENABLED
+  inMemoryQRAccessStatus = 'ENABLED';
+  lastStatusFetchedAt = now;
+  return 'ENABLED';
+}
 
-  try {
-    fs.writeFileSync(ACTIVE_QR_FILE, JSON.stringify(initialStore, null, 2), 'utf-8');
-  } catch (err) {
-    console.error('[QR Challenge Service] Failed to write initial active-qr.json:', err);
+/**
+ * Authoritative Admin Mutation: Enable or Disable Classroom QR Access
+ * Only mdausafmohiuddin@gmail.com is authorized.
+ */
+export async function setQRAccessStatus(
+  adminEmail: string,
+  newStatus: QRAccessStatus
+): Promise<{ success: boolean; status: QRAccessStatus; updatedAt: string }> {
+  if (!isAuthorizedAdmin(adminEmail)) {
+    throw new Error('Unauthorized: Only authorized administrator (mdausafmohiuddin@gmail.com) can change QR access.');
   }
 
-  return initialStore;
-}
+  const nowIso = new Date().toISOString();
+  inMemoryQRAccessStatus = newStatus;
+  lastStatusFetchedAt = Date.now();
 
-/**
- * Saves the QR challenge store atomically to disk
- */
-function saveQRStore(store: ActiveQRStore): void {
+  const accessRecord = {
+    status: newStatus,
+    updatedAt: nowIso,
+    updatedBy: adminEmail,
+  };
+
+  // 1. Update Firestore doc settings/qr_access
+  try {
+    const settingRef = doc(db, 'settings', 'qr_access');
+    await setDoc(settingRef, accessRecord, { merge: true });
+  } catch (err) {
+    console.warn('[QR Service] Firestore status write warning (falling back to disk):', err);
+  }
+
+  // 2. Persist to local disk
   ensureDataDir();
-  const tempPath = `${ACTIVE_QR_FILE}.tmp.${Date.now()}`;
-  fs.writeFileSync(tempPath, JSON.stringify(store, null, 2), 'utf-8');
-  fs.renameSync(tempPath, ACTIVE_QR_FILE);
+  try {
+    fs.writeFileSync(QR_ACCESS_FILE, JSON.stringify(accessRecord, null, 2), 'utf-8');
+    // Also keep active-qr.json in sync for legacy compatibility
+    const activeLegacy = {
+      activeChallenge: {
+        challengeId: 'ASDC_OFFICIAL_PERMANENT_QR',
+        status: newStatus === 'ENABLED' ? 'ACTIVE' : 'INACTIVE',
+        batchId: INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
+        issuer: 'ASDC',
+        classroomId: INSTITUTE_CONFIG.CLASSROOM_SECRET_KEY,
+        generatedAt: '2026-10-19T00:00:00.000Z',
+        generatedBy: SOLE_ADMIN_EMAIL,
+        qrPayload: OFFICIAL_PERMANENT_QR_PAYLOAD,
+      },
+      status: newStatus,
+      updatedAt: nowIso,
+    };
+    fs.writeFileSync(ACTIVE_QR_FILE, JSON.stringify(activeLegacy, null, 2), 'utf-8');
+  } catch (err) {
+    // In read-only serverless, file write might fail, which is okay since Firestore is updated
+  }
+
+  console.log(`[QR Service] Classroom QR Access updated to ${newStatus} by ${adminEmail}`);
+
+  return {
+    success: true,
+    status: newStatus,
+    updatedAt: nowIso,
+  };
 }
 
 /**
- * Generates high-res Data URL for a given payload
+ * Validates whether classroom attendance QR is valid and currently accepted.
  */
-export async function generateQRDataUrlFromPayload(payload: ClassroomQRPayload): Promise<string> {
-  const jsonString = JSON.stringify(payload);
-  return await QRCode.toDataURL(jsonString, {
-    width: 512,
-    margin: 2,
-    color: {
-      dark: '#0f172a', // Navy blue
-      light: '#ffffff',
-    },
-    errorCorrectionLevel: 'H',
-  });
+export async function validateClassroomQR(qrPayload: any): Promise<{
+  isValid: boolean;
+  reason?: string;
+  isQrDisabled?: boolean;
+}> {
+  // 1. Check Backend QR Access ON/OFF status first
+  const accessStatus = await getQRAccessStatus();
+  if (accessStatus === 'DISABLED') {
+    return {
+      isValid: false,
+      isQrDisabled: true,
+      reason: 'Attendance is currently disabled by the administrator. Please wait until the administrator enables attendance.',
+    };
+  }
+
+  // 2. Validate payload structure
+  if (!qrPayload || typeof qrPayload !== 'object') {
+    return {
+      isValid: false,
+      reason: 'Invalid QR code. The scanned QR is not valid classroom attendance data.',
+    };
+  }
+
+  if (
+    qrPayload.issuer !== 'ASDC' ||
+    qrPayload.type !== 'classroom_attendance' ||
+    qrPayload.classroomId !== INSTITUTE_CONFIG.CLASSROOM_SECRET_KEY
+  ) {
+    return {
+      isValid: false,
+      reason: 'Invalid Classroom QR. Scanned QR code does not match official ASDC AI Builder Mastery classroom.',
+    };
+  }
+
+  if (qrPayload.batchId !== INSTITUTE_CONFIG.DEFAULT_BATCH_ID) {
+    return {
+      isValid: false,
+      reason: `Unauthorized Batch: Only students enrolled in '${INSTITUTE_CONFIG.DEFAULT_BATCH_NAME}' may submit attendance.`,
+    };
+  }
+
+  return { isValid: true };
 }
 
 /**
- * Returns current active QR challenge and its QR image
+ * Returns current active permanent QR information and access status
  */
 export async function getActiveQRChallenge() {
-  const store = loadQRStore();
-  const qrDataUrl = await generateQRDataUrlFromPayload(store.activeChallenge.qrPayload);
+  const status = await getQRAccessStatus();
+  const qrDataUrl = await generateClassroomQRDataUrl();
+
+  const challenge: ActiveQRChallenge = {
+    challengeId: 'ASDC_OFFICIAL_PERMANENT_QR',
+    status: status === 'ENABLED' ? 'ACTIVE' : 'INACTIVE',
+    batchId: INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
+    issuer: 'ASDC',
+    classroomId: INSTITUTE_CONFIG.CLASSROOM_SECRET_KEY,
+    generatedAt: '2026-10-19T00:00:00.000Z',
+    generatedBy: SOLE_ADMIN_EMAIL,
+    qrPayload: OFFICIAL_PERMANENT_QR_PAYLOAD,
+  };
 
   return {
-    challenge: store.activeChallenge,
+    challenge,
     qrDataUrl,
-    totalRefreshes: store.history.length > 0 ? store.history.length - 1 : 0,
-    history: store.history,
+    qrAccessStatus: status,
+    isPermanent: true,
+    totalRefreshes: 0,
+    history: [],
   };
 }
 
 /**
- * Admin action: Refreshes the QR code challenge atomically.
- * Invalidates previous challenge immediately.
- */
-export async function refreshQRChallenge(adminEmail: string) {
-  if (!isAuthorizedAdmin(adminEmail)) {
-    throw new Error('Unauthorized: Only the authorized administrator (mdausafmohiuddin@gmail.com) can refresh QR codes.');
-  }
-
-  const store = loadQRStore();
-  const previousChallenge = store.activeChallenge;
-  const nowIso = new Date().toISOString();
-
-  // Invalidate previous in history
-  if (previousChallenge) {
-    const existingHistIdx = store.history.findIndex((h) => h.challengeId === previousChallenge.challengeId);
-    if (existingHistIdx >= 0) {
-      store.history[existingHistIdx].status = 'INVALIDATED';
-      store.history[existingHistIdx].invalidatedAt = nowIso;
-    } else {
-      store.history.unshift({
-        challengeId: previousChallenge.challengeId,
-        status: 'INVALIDATED',
-        generatedAt: previousChallenge.generatedAt,
-        generatedBy: previousChallenge.generatedBy,
-        invalidatedAt: nowIso,
-      });
-    }
-  }
-
-  // Generate brand new challenge
-  const newChallenge = createChallengeRecord(adminEmail);
-  store.activeChallenge = newChallenge;
-  store.history.unshift({
-    challengeId: newChallenge.challengeId,
-    status: 'ACTIVE',
-    generatedAt: newChallenge.generatedAt,
-    generatedBy: adminEmail,
-  });
-
-  // Keep history to last 50 entries
-  if (store.history.length > 50) {
-    store.history = store.history.slice(0, 50);
-  }
-
-  // Save atomically
-  saveQRStore(store);
-
-  // Generate QR image
-  const qrDataUrl = await generateQRDataUrlFromPayload(newChallenge.qrPayload);
-
-  console.log(
-    `[QR Challenge Service] QR refreshed by ${adminEmail}. New Challenge ID: ${newChallenge.challengeId}, Previous ${previousChallenge?.challengeId} invalidated.`
-  );
-
-  return {
-    challenge: newChallenge,
-    previousChallengeId: previousChallenge?.challengeId,
-    qrDataUrl,
-    totalRefreshes: store.history.length - 1,
-    history: store.history,
-  };
-}
-
-/**
- * Admin action: Deactivate current QR code (e.g. after class ends)
- */
-export async function toggleQRChallengeActive(adminEmail: string, activate: boolean) {
-  if (!isAuthorizedAdmin(adminEmail)) {
-    throw new Error('Unauthorized: Only administrator can toggle QR code activation.');
-  }
-
-  const store = loadQRStore();
-  store.activeChallenge.status = activate ? 'ACTIVE' : 'INACTIVE';
-  saveQRStore(store);
-
-  const qrDataUrl = await generateQRDataUrlFromPayload(store.activeChallenge.qrPayload);
-
-  return {
-    challenge: store.activeChallenge,
-    qrDataUrl,
-    history: store.history,
-  };
-}
-
-/**
- * Validates a submitted QR challenge against the current active challenge.
+ * Legacy compatibility: validateQRChallenge
  */
 export function validateQRChallenge(challengeId?: string): {
   isValid: boolean;
   reason?: string;
   activeChallengeId?: string;
+  isQrDisabled?: boolean;
 } {
-  const store = loadQRStore();
-  const current = store.activeChallenge;
-
-  if (current.status !== 'ACTIVE') {
+  // If memory status says disabled
+  if (inMemoryQRAccessStatus === 'DISABLED') {
     return {
       isValid: false,
-      reason: 'The classroom QR code is currently inactive. Please wait for the instructor to activate it.',
-      activeChallengeId: current.challengeId,
+      isQrDisabled: true,
+      reason: 'Attendance is currently disabled by the administrator. Please wait until the administrator enables attendance.',
+      activeChallengeId: 'ASDC_OFFICIAL_PERMANENT_QR',
     };
   }
 
-  // If payload does not contain challengeId, it's an old legacy QR
-  if (!challengeId) {
-    return {
-      isValid: false,
-      reason: 'Outdated QR code. Please scan the current active classroom QR displayed on screen.',
-      activeChallengeId: current.challengeId,
-    };
-  }
-
-  if (challengeId !== current.challengeId) {
-    // Check if it was an old invalidated challenge
-    const wasInvalidated = store.history.some(
-      (h) => h.challengeId === challengeId && h.status === 'INVALIDATED'
-    );
-
-    return {
-      isValid: false,
-      reason: wasInvalidated
-        ? 'This QR code has been invalidated by an administrator refresh. Please scan the latest active QR code.'
-        : 'Invalid QR challenge token. Please scan the official active classroom QR code.',
-      activeChallengeId: current.challengeId,
-    };
-  }
-
+  // The permanent QR is always valid
   return {
     isValid: true,
-    activeChallengeId: current.challengeId,
+    activeChallengeId: 'ASDC_OFFICIAL_PERMANENT_QR',
+  };
+}
+
+/**
+ * Legacy compatibility: toggleQRChallengeActive
+ */
+export async function toggleQRChallengeActive(adminEmail: string, activate: boolean) {
+  const result = await setQRAccessStatus(adminEmail, activate ? 'ENABLED' : 'DISABLED');
+  const qrDataUrl = await generateClassroomQRDataUrl();
+  return {
+    challenge: {
+      challengeId: 'ASDC_OFFICIAL_PERMANENT_QR',
+      status: result.status === 'ENABLED' ? 'ACTIVE' : 'INACTIVE',
+      batchId: INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
+      issuer: 'ASDC',
+      classroomId: INSTITUTE_CONFIG.CLASSROOM_SECRET_KEY,
+      generatedAt: '2026-10-19T00:00:00.000Z',
+      generatedBy: adminEmail,
+      qrPayload: OFFICIAL_PERMANENT_QR_PAYLOAD,
+    },
+    qrAccessStatus: result.status,
+    qrDataUrl,
+    history: [],
+  };
+}
+
+/**
+ * Legacy compatibility: refreshQRChallenge
+ * As requested: NO regeneration. Returns the permanent QR code.
+ */
+export async function refreshQRChallenge(adminEmail: string) {
+  if (!isAuthorizedAdmin(adminEmail)) {
+    throw new Error('Unauthorized: Only authorized administrator can access classroom QR.');
+  }
+
+  const qrDataUrl = await generateClassroomQRDataUrl();
+  const status = await getQRAccessStatus();
+
+  return {
+    challenge: {
+      challengeId: 'ASDC_OFFICIAL_PERMANENT_QR',
+      status: status === 'ENABLED' ? 'ACTIVE' : 'INACTIVE',
+      batchId: INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
+      issuer: 'ASDC',
+      classroomId: INSTITUTE_CONFIG.CLASSROOM_SECRET_KEY,
+      generatedAt: '2026-10-19T00:00:00.000Z',
+      generatedBy: adminEmail,
+      qrPayload: OFFICIAL_PERMANENT_QR_PAYLOAD,
+    },
+    qrAccessStatus: status,
+    qrDataUrl,
+    isPermanent: true,
+    totalRefreshes: 0,
+    history: [],
+    message: 'Official ASDC classroom QR code is permanent and static.',
   };
 }

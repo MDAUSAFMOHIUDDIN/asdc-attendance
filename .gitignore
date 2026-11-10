@@ -15,7 +15,6 @@ build/
 dist/
 *.tsbuildinfo
 next-env.d.ts.bak
-data/master-unpacked/
 *.tmp*
 *.tmp.*
 

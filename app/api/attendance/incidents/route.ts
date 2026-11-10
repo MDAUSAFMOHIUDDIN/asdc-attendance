@@ -14,7 +14,7 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const incidents = getLocationIncidents(adminEmail);
+    const incidents = await getLocationIncidents(adminEmail);
     return NextResponse.json({
       success: true,
       incidents,
@@ -44,7 +44,7 @@ export async function POST(request: NextRequest) {
         );
       }
 
-      const updatedIncidents = markIncidentReviewed(adminEmail, incidentId);
+      const updatedIncidents = await markIncidentReviewed(adminEmail, incidentId);
       return NextResponse.json({
         success: true,
         message: 'Incident marked as reviewed.',
@@ -69,7 +69,7 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: 'Missing incident report fields' }, { status: 400 });
     }
 
-    const incident = logLocationIncident({
+    const incident = await logLocationIncident({
       studentId,
       studentName: studentName || 'Unknown Student',
       studentEmail: studentEmail || '',

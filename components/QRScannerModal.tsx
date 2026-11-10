@@ -64,6 +64,7 @@ export type ScannerErrorType =
   | 'LOCATION_OUTSIDE'
   | 'LOCATION_ACCURACY'
   | 'INVALID_QR'
+  | 'QR_DISABLED'
   | 'GENERIC'
   | null;
 
@@ -411,6 +412,8 @@ export function QRScannerModal({
             setErrorType('LOCATION_OUTSIDE');
           } else if (data.errorType === 'INSUFFICIENT_LOCATION_ACCURACY') {
             setErrorType('LOCATION_ACCURACY');
+          } else if (data.errorType === 'QR_ACCESS_DISABLED' || data.isQrDisabled) {
+            setErrorType('QR_DISABLED');
           } else if (data.isExpiredChallenge) {
             setErrorType('INVALID_QR');
           } else {
@@ -864,32 +867,6 @@ export function QRScannerModal({
     }
   };
 
-  // Simulated classroom scan for instant preview/testing
-  const handleSimulatedScan = async () => {
-    try {
-      const res = await fetch('/api/attendance/qr/active');
-      const data = await res.json();
-      if (data && data.qrPayload) {
-        if (!locationCoordsRef.current) {
-          const testCoords = {
-            latitude: ASDC_COORDS.lat,
-            longitude: ASDC_COORDS.lon,
-            accuracy: 15,
-          };
-          locationCoordsRef.current = testCoords;
-          setLocationCoords(testCoords);
-          setLocationStatus('acquired');
-          setLocationDistance(0);
-        }
-        const jsonString = JSON.stringify(data.qrPayload);
-        await handleAttendanceSubmission(jsonString);
-      } else {
-        showScanWarning('Active classroom QR payload not found.');
-      }
-    } catch {
-      showScanWarning('Network error loading active QR.');
-    }
-  };
 
   // Copy diagnostics report to clipboard
   const copyDiagnostics = () => {
@@ -1238,6 +1215,8 @@ export function QRScannerModal({
             <div className="absolute inset-3 sm:inset-4 bg-white border border-slate-200 rounded-2xl p-4 sm:p-5 flex flex-col items-center justify-center text-center z-20 shadow-xl overflow-y-auto">
               {errorType === 'LOCATION_OUTSIDE' ? (
                 <MapPinOff className="w-12 h-12 text-rose-600 mb-2 flex-shrink-0" />
+              ) : errorType === 'QR_DISABLED' ? (
+                <ShieldAlert className="w-12 h-12 text-rose-600 mb-2 flex-shrink-0" />
               ) : errorType === 'LOCATION_DENIED' ? (
                 <MapPinOff className="w-12 h-12 text-amber-500 mb-2 flex-shrink-0" />
               ) : errorType === 'LOCATION_ACCURACY' ? (
@@ -1253,12 +1232,14 @@ export function QRScannerModal({
               <h4 className="text-sm font-extrabold text-slate-950 mb-1">
                 {errorType === 'LOCATION_OUTSIDE'
                   ? 'Outside ASDC Institute Campus'
+                  : errorType === 'QR_DISABLED'
+                  ? 'Classroom Attendance Disabled'
                   : errorType === 'LOCATION_DENIED'
                   ? 'Location Permission Required'
                   : errorType === 'LOCATION_ACCURACY'
                   ? 'Low GPS Accuracy'
                   : errorType === 'INVALID_QR'
-                  ? 'QR Code Invalidated'
+                  ? 'Classroom QR Not Recognized'
                   : errorType === 'PERMISSION'
                   ? 'Camera Permission Denied'
                   : errorType === 'IFRAME_BLOCKED'
@@ -1315,14 +1296,6 @@ export function QRScannerModal({
                 >
                   <Upload className="w-3.5 h-3.5" />
                   Upload Photo of Classroom QR
-                </button>
-
-                <button
-                  type="button"
-                  onClick={handleSimulatedScan}
-                  className="w-full py-2 bg-slate-50 hover:bg-slate-100 text-slate-600 hover:text-slate-900 font-semibold text-[11px] rounded-lg transition"
-                >
-                  Simulate Classroom Scan (Testing)
                 </button>
               </div>
             </div>

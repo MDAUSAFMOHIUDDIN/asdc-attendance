@@ -15,8 +15,11 @@ export async function GET(request: NextRequest) {
         success: true,
         challenge: activeInfo.challenge,
         qrDataUrl: activeInfo.qrDataUrl,
-        totalRefreshes: activeInfo.totalRefreshes,
-        history: activeInfo.history,
+        qrAccessStatus: activeInfo.qrAccessStatus,
+        status: activeInfo.qrAccessStatus,
+        isPermanent: true,
+        totalRefreshes: 0,
+        history: [],
       });
     }
 
@@ -24,10 +27,11 @@ export async function GET(request: NextRequest) {
     return NextResponse.json({
       success: true,
       challengeId: activeInfo.challenge.challengeId,
-      status: activeInfo.challenge.status,
-      generatedAt: activeInfo.challenge.generatedAt,
+      status: activeInfo.qrAccessStatus,
+      qrAccessStatus: activeInfo.qrAccessStatus,
       qrPayload: activeInfo.challenge.qrPayload,
       qrDataUrl: activeInfo.qrDataUrl,
+      isPermanent: true,
     });
   } catch (error) {
     console.error('Error fetching active QR challenge:', error);

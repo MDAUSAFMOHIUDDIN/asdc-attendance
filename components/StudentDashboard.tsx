@@ -17,6 +17,8 @@ import { StudentProfile, AttendanceRecord, Announcement, Holiday, StudentAttenda
 import { getStudentAttendanceRecords, getAnnouncements, getHolidays, calculateStudentSummary } from '@/lib/attendance-service';
 import { formatDisplayDate, formatDisplayTimestamp, checkAttendanceWindow, getISTTimeInfo } from '@/lib/date-utils';
 import { INSTITUTE_CONFIG } from '@/lib/admin-config';
+import { db } from '@/lib/firebase';
+import { doc, onSnapshot } from 'firebase/firestore';
 import { QRScannerModal } from './QRScannerModal';
 
 interface StudentDashboardProps {
@@ -38,6 +40,32 @@ export function StudentDashboard({
   const [liveIstTime, setLiveIstTime] = useState<string>('');
   const [windowStatus, setWindowStatus] = useState(checkAttendanceWindow());
   const [profileModalOpen, setProfileModalOpen] = useState(false);
+  const [qrAccessStatus, setQrAccessStatus] = useState<'ENABLED' | 'DISABLED'>('ENABLED');
+
+  // Real-time listener for Administrator QR Access ON/OFF state
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    try {
+      const docRef = doc(db, 'settings', 'qr_access');
+      unsubscribe = onSnapshot(
+        docRef,
+        (snap) => {
+          if (snap.exists()) {
+            const data = snap.data();
+            if (data?.status === 'ENABLED' || data?.status === 'DISABLED') {
+              setQrAccessStatus(data.status);
+            }
+          }
+        },
+        (err) => console.warn('Student QR access listener notice:', err)
+      );
+    } catch (err) {
+      // fallback
+    }
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
 
   const handleCloseScanner = useCallback(() => {
     setScannerOpen(false);
@@ -250,8 +278,16 @@ export function StudentDashboard({
           {/* Status helper banner */}
           <div className="mt-4 pt-4 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2 text-xs">
             <div className="flex items-center gap-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-500 animate-pulse" />
-              <span className="text-slate-700 font-medium">Classroom attendance scanner is active anytime today.</span>
+              <span
+                className={`w-2.5 h-2.5 rounded-full ${
+                  qrAccessStatus === 'ENABLED' ? 'bg-emerald-500 animate-pulse' : 'bg-rose-500'
+                }`}
+              />
+              <span className={`font-medium ${qrAccessStatus === 'ENABLED' ? 'text-slate-700' : 'text-rose-700 font-bold'}`}>
+                {qrAccessStatus === 'ENABLED'
+                  ? 'Classroom attendance scanner is active.'
+                  : 'Attendance is currently disabled by the administrator. Please wait until the administrator enables attendance.'}
+              </span>
             </div>
             <span className="text-slate-600 font-mono text-[11px] sm:hidden font-semibold">
               {liveIstTime}

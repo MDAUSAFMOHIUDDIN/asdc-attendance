@@ -173,29 +173,56 @@ function saveMeta(meta: MasterMeta) {
  * Initialize Master Workbook environment and backup
  */
 export async function ensureMasterWorkbook(): Promise<void> {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  try {
+    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+    if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
+  } catch {
+    // In read-only serverless environment, ignore mkdir errors
+  }
 
-  // If master-attendance.xlsx does not exist, copy from source
+  // If master-attendance.xlsx does not exist, restore from backup or source
   if (!fs.existsSync(MASTER_XLSX_PATH)) {
-    if (fs.existsSync(SOURCE_DOWNLOAD_PATH)) {
-      fs.copyFileSync(SOURCE_DOWNLOAD_PATH, MASTER_XLSX_PATH);
+    if (fs.existsSync(INITIAL_BACKUP_PATH)) {
+      try {
+        fs.copyFileSync(INITIAL_BACKUP_PATH, MASTER_XLSX_PATH);
+      } catch {
+        // read-only fs
+      }
+    } else if (fs.existsSync(SOURCE_DOWNLOAD_PATH)) {
+      try {
+        fs.copyFileSync(SOURCE_DOWNLOAD_PATH, MASTER_XLSX_PATH);
+      } catch {
+        // read-only fs
+      }
     }
   }
 
   // Ensure initial backup exists
   if (!fs.existsSync(INITIAL_BACKUP_PATH) && fs.existsSync(MASTER_XLSX_PATH)) {
-    fs.copyFileSync(MASTER_XLSX_PATH, INITIAL_BACKUP_PATH);
+    try {
+      fs.copyFileSync(MASTER_XLSX_PATH, INITIAL_BACKUP_PATH);
+    } catch {
+      // read-only fs
+    }
   }
 
   // Ensure unpacked directory exists
   const sheet1Path = path.join(UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
   if (!fs.existsSync(sheet1Path) && fs.existsSync(MASTER_XLSX_PATH)) {
-    // Unpack using PowerShell System.IO.Compression.ZipFile
-    const { execSync } = require('child_process');
-    execSync(
-      `powershell -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('${MASTER_XLSX_PATH}', '${UNPACKED_DIR}')"`
-    );
+    try {
+      const { execSync } = require('child_process');
+      if (process.platform === 'win32') {
+        execSync(
+          `powershell -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('${MASTER_XLSX_PATH}', '${UNPACKED_DIR}')"`,
+          { stdio: 'ignore' }
+        );
+      } else {
+        // Linux / serverless environment
+        execSync(`unzip -q -o "${MASTER_XLSX_PATH}" -d "${UNPACKED_DIR}"`, { stdio: 'ignore' });
+      }
+    } catch (extractErr) {
+      console.warn('[Excel Master] Note during initial extraction:', extractErr);
+    }
   }
 
   readMeta();
@@ -968,8 +995,14 @@ export async function correctAttendanceEntryInMaster(params: {
  * Public: Get path to canonical master workbook file for download
  */
 export function getMasterWorkbookFilePath(): string {
-  if (!fs.existsSync(MASTER_XLSX_PATH)) {
-    throw new Error('Master Excel workbook not initialized.');
+  if (fs.existsSync(MASTER_XLSX_PATH)) {
+    return MASTER_XLSX_PATH;
   }
-  return MASTER_XLSX_PATH;
+  if (fs.existsSync(INITIAL_BACKUP_PATH)) {
+    return INITIAL_BACKUP_PATH;
+  }
+  if (fs.existsSync(SOURCE_DOWNLOAD_PATH)) {
+    return SOURCE_DOWNLOAD_PATH;
+  }
+  throw new Error('Master Excel workbook B-19-AI Builder (1) (3).xlsx not found.');
 }

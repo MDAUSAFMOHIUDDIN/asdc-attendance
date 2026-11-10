@@ -157,5 +157,14 @@ service cloud.firestore {
       allow list: if isSignedIn();
       allow create, update, delete: if isAdmin() && isValidId(settingId);
     }
+
+    // Real-Time Location Security Incidents (Only sole admin can read and review)
+    match /location_incidents/{incidentId} {
+      allow get: if isAdmin();
+      allow list: if isAdmin();
+      allow create: if isValidId(incidentId);
+      allow update: if isAdmin() && isValidId(incidentId);
+      allow delete: if isAdmin() && isValidId(incidentId);
+    }
   }
 }
