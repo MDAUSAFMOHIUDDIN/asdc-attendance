@@ -82,7 +82,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 6. Authoritative Backend Geofence Verification (100m permitted radius, max 50m GPS accuracy)
+    // 6. Authoritative Backend Geofence Verification (2000m permitted radius, max 50m GPS accuracy)
     const locResult = verifyStudentLocation(location);
     if (!locResult.isValid) {
       // Record genuine incident in backend database with safe retry handling

@@ -13,7 +13,7 @@ export const OFFICIAL_ASDC_LOCATION = {
   latitude: 17.34668005,
   longitude: 78.46089325,
   googleMapsUrl: 'https://maps.app.goo.gl/MfGyprjpRgzpwjsV7',
-  defaultRadiusMeters: 100,
+  defaultRadiusMeters: 2000,
   defaultMaxAccuracyMeters: 50,
 };
 
@@ -137,7 +137,7 @@ export interface LocationVerificationResult {
 
 /**
  * Authoritative Backend Verification of Student Location
- * Rejects outside ASDC radius (100m) or poor GPS accuracy (>50m).
+ * Rejects outside ASDC radius (2,000m) or poor GPS accuracy (>50m).
  * Prevents client-side manipulation.
  */
 export function verifyStudentLocation(coords?: {
@@ -184,7 +184,7 @@ export function verifyStudentLocation(coords?: {
     coords.longitude
   );
 
-  // 3. Permitted Radius check (100 meters)
+  // 3. Permitted Radius check (2,000 meters)
   if (distanceMeters > config.radiusMeters) {
     return {
       isValid: false,
@@ -231,7 +231,7 @@ export async function logLocationIncident(
     longitude: incidentData.longitude ?? null,
     gpsAccuracy: incidentData.gpsAccuracy ?? null,
     distanceMeters: incidentData.distanceMeters ?? null,
-    allowedRadiusMeters: incidentData.allowedRadiusMeters || 100,
+    allowedRadiusMeters: incidentData.allowedRadiusMeters || 2000,
     details: incidentData.details || '',
     challengeId: incidentData.challengeId || null,
   };

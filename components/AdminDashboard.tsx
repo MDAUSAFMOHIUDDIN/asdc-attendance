@@ -250,7 +250,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
       const data = await res.json();
       if (data.success && data.config) {
         setGeofenceConfig(data.config);
-        setGeofenceRadiusInput(data.config.radiusMeters || 100);
+        setGeofenceRadiusInput(data.config.radiusMeters || 2000);
         setGeofenceAccuracyInput(data.config.maxAccuracyMeters || 50);
       }
     } catch (err) {
@@ -1765,7 +1765,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                     </div>
                     <p className="text-xs font-semibold leading-relaxed">
                       {qrAccessStatus === 'ENABLED'
-                        ? 'Attendance submissions are currently ENABLED. Authenticated students within the 100m ASDC campus radius can scan the permanent classroom QR to mark attendance.'
+                        ? 'Attendance submissions are currently ENABLED. Authenticated students within the 2,000m ASDC campus radius can scan the permanent classroom QR to mark attendance.'
                         : 'Attendance is currently DISABLED by the administrator. Any student scan attempt will be safely rejected on the backend without recording attendance.'}
                     </p>
                   </div>

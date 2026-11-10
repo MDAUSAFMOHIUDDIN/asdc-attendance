@@ -160,6 +160,15 @@ async function runVerification() {
   const insideResult = verifyStudentLocation(insideLoc);
   assert(insideResult.isValid === true, `Student inside ASDC radius is accepted (distance: ${insideResult.distanceMeters}m)`);
 
+  // 3a-2. Within 2,000m ASDC radius (e.g. ~1,100m away near Charminar)
+  const nearbyLoc = {
+    latitude: OFFICIAL_ASDC_LOCATION.latitude + 0.01,
+    longitude: OFFICIAL_ASDC_LOCATION.longitude,
+    accuracy: 15,
+  };
+  const nearbyResult = verifyStudentLocation(nearbyLoc);
+  assert(nearbyResult.isValid === true, `Student within 2,000m radius is accepted (distance: ${nearbyResult.distanceMeters}m)`);
+
   // 3b. Outside ASDC campus (Secunderabad coords, ~11 km away)
   const outsideLoc = {
     latitude: 17.4399,
@@ -169,7 +178,7 @@ async function runVerification() {
   const outsideResult = verifyStudentLocation(outsideLoc);
   assert(outsideResult.isValid === false, 'Student outside ASDC radius is rejected');
   assert(outsideResult.errorType === 'OUTSIDE_GEOFENCE', 'Error type is correctly identified as OUTSIDE_GEOFENCE');
-  assert(outsideResult.distanceMeters > 1000, `Distance correctly calculated (>1000m: ${outsideResult.distanceMeters}m)`);
+  assert(outsideResult.distanceMeters > 2000, `Distance correctly calculated (>2000m: ${outsideResult.distanceMeters}m)`);
 
   // 3c. Poor GPS accuracy check (> 50m)
   const poorAccuracyLoc = {
@@ -192,7 +201,7 @@ async function runVerification() {
     longitude: outsideLoc.longitude,
     gpsAccuracy: outsideLoc.accuracy,
     distanceMeters: outsideResult.distanceMeters,
-    allowedRadiusMeters: 100,
+    allowedRadiusMeters: 2000,
     details: outsideResult.message,
   });
 
