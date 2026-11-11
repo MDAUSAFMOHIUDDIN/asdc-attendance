@@ -7,6 +7,10 @@
  * 
  * Manages the single persistent master Excel workbook with:
  * - Direct OpenXML preservation (layout, styles, formulas, merged cells, history)
+ * - Safe Vercel serverless execution: Never modifies read-only deployment directory (/var/task)
+ * - Persistent writable Cloud Storage integration (Firebase Storage) with local persistent fallback
+ * - Atomic manipulation in writable temporary workspace (os.tmpdir() / /tmp)
+ * - Pure Node.js ZIP extraction without external CLI dependencies (no powershell, no unzip)
  * - Date-based column mapping (IST Asia/Kolkata)
  * - Safe concurrency serialization via AsyncLock
  * - Atomic file writes and version tracking
@@ -16,34 +20,76 @@
 
 import fs from 'fs';
 import path from 'path';
+import os from 'os';
+import zlib from 'zlib';
 import archiver from 'archiver';
 import AsyncLock from 'async-lock';
 import { SOLE_ADMIN_EMAIL, isAuthorizedAdmin } from './admin-config.ts';
+import { storage } from './firebase.ts';
+import { ref, getBytes, uploadBytes } from 'firebase/storage';
 
 const lock = new AsyncLock();
 
-// Directory & File Paths
-const PROJECT_ROOT = process.cwd();
-const DATA_DIR = path.join(PROJECT_ROOT, 'data');
-const BACKUP_DIR = path.join(DATA_DIR, 'backup');
-const MASTER_XLSX_PATH = path.join(DATA_DIR, 'master-attendance.xlsx');
-const INITIAL_BACKUP_PATH = path.join(BACKUP_DIR, 'B-19-AI Builder (1) (3).initial-backup.xlsx');
-const UNPACKED_DIR = path.join(DATA_DIR, 'master-unpacked');
-const META_FILE_PATH = path.join(DATA_DIR, 'master-meta.json');
+// Canonical cloud storage object paths in Firebase Storage
+export const CANONICAL_STORAGE_FILE = 'master-attendance/master-attendance.xlsx';
+export const CANONICAL_STORAGE_META = 'master-attendance/master-meta.json';
 
-// Source workbook location in Downloads as designated by the user
+// Bundled Read-Only Template Paths (Inside deployment bundle /var/task - NEVER WRITTEN TO)
+const PROJECT_ROOT = process.cwd();
+const BUNDLED_DATA_DIR = path.join(PROJECT_ROOT, 'data');
+const BUNDLED_BACKUP_DIR = path.join(BUNDLED_DATA_DIR, 'backup');
+const BUNDLED_MASTER_XLSX = path.join(BUNDLED_DATA_DIR, 'master-attendance.xlsx');
+const BUNDLED_BACKUP_XLSX = path.join(BUNDLED_BACKUP_DIR, 'B-19-AI Builder (1) (3).initial-backup.xlsx');
+const BUNDLED_META_PATH = path.join(BUNDLED_DATA_DIR, 'master-meta.json');
 const SOURCE_DOWNLOAD_PATH = 'C:\\Users\\Students\\Downloads\\B-19-AI Builder (1) (3).xlsx';
+
+// Writable Temporary Directory in os.tmpdir() (/tmp on Vercel / Linux)
+const TMP_BASE_DIR = path.join(os.tmpdir(), 'asdc-excel-master');
+const TMP_MASTER_XLSX = path.join(TMP_BASE_DIR, 'master-attendance.xlsx');
+const TMP_META_PATH = path.join(TMP_BASE_DIR, 'master-meta.json');
+const TMP_UNPACKED_DIR = path.join(TMP_BASE_DIR, 'unpacked');
+
+/**
+ * Checks whether a given directory is writable
+ */
+function isDirectoryWritable(dir: string): boolean {
+  try {
+    if (!fs.existsSync(dir)) {
+      fs.mkdirSync(dir, { recursive: true });
+    }
+    const testFile = path.join(dir, `.test_write_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`);
+    fs.writeFileSync(testFile, 'ok');
+    fs.unlinkSync(testFile);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Persistent fallback directory (used if configured or during local dev when data/ is writable)
+const PERSISTENT_STORAGE_ENV = process.env.PERSISTENT_STORAGE_DIR || null;
+export const LOCAL_PERSISTENT_DIR = (() => {
+  if (PERSISTENT_STORAGE_ENV && isDirectoryWritable(PERSISTENT_STORAGE_ENV)) {
+    return PERSISTENT_STORAGE_ENV;
+  }
+  // If running locally (not on Vercel) and BUNDLED_DATA_DIR is writable
+  if (!process.env.VERCEL && isDirectoryWritable(BUNDLED_DATA_DIR)) {
+    const pDir = path.join(BUNDLED_DATA_DIR, 'storage');
+    if (!fs.existsSync(pDir)) {
+      try { fs.mkdirSync(pDir, { recursive: true }); } catch {}
+    }
+    return pDir;
+  }
+  return null;
+})();
 
 // Excel OpenXML Base Epoch (1899-12-30 for 1900 date system leap year compatibility)
 const EXCEL_EPOCH = new Date(Date.UTC(1899, 11, 30));
 
 // Shared String IDs in the canonical workbook
-// 13: "P" (Present)
-// 14: "A" (Absent)
-// 15: "L" (Leave / Excused)
-export const SHARED_STRING_PRESENT = 13;
-export const SHARED_STRING_ABSENT = 14;
-export const SHARED_STRING_LEAVE = 15;
+export const SHARED_STRING_PRESENT = 13; // "P"
+export const SHARED_STRING_ABSENT = 14;  // "A"
+export const SHARED_STRING_LEAVE = 15;   // "L"
 
 export interface ExcelStudentRow {
   row: number;
@@ -95,6 +141,94 @@ export interface MasterMeta {
 }
 
 /**
+ * Ensures the temporary base directory exists in os.tmpdir()
+ */
+function ensureTmpBaseDir(): void {
+  try {
+    if (!fs.existsSync(TMP_BASE_DIR)) {
+      fs.mkdirSync(TMP_BASE_DIR, { recursive: true });
+    }
+    if (!fs.existsSync(TMP_UNPACKED_DIR)) {
+      fs.mkdirSync(TMP_UNPACKED_DIR, { recursive: true });
+    }
+  } catch (err) {
+    console.warn('[Excel Master] Error creating temp directories:', err);
+  }
+}
+
+/**
+ * Pure Node.js ZIP extractor: extracts a ZIP buffer into targetDir
+ * Zero external CLI dependencies (no powershell, no unzip).
+ * 100% serverless and cross-platform compatible.
+ */
+export function extractZipBuffer(zipBuffer: Buffer, targetDir: string): number {
+  let eocdOffset = -1;
+  for (let i = zipBuffer.length - 22; i >= 0; i--) {
+    if (zipBuffer.readUInt32LE(i) === 0x06054b50) {
+      eocdOffset = i;
+      break;
+    }
+  }
+
+  if (eocdOffset === -1) {
+    throw new Error('Invalid ZIP file: End of Central Directory record not found');
+  }
+
+  const totalEntries = zipBuffer.readUInt16LE(eocdOffset + 10);
+  const cdOffset = zipBuffer.readUInt32LE(eocdOffset + 16);
+
+  let curCdOffset = cdOffset;
+  let count = 0;
+
+  for (let i = 0; i < totalEntries; i++) {
+    const signature = zipBuffer.readUInt32LE(curCdOffset);
+    if (signature !== 0x02014b50) {
+      throw new Error(`Invalid Central Directory Header at offset ${curCdOffset}`);
+    }
+
+    const compressionMethod = zipBuffer.readUInt16LE(curCdOffset + 10);
+    const compressedSize = zipBuffer.readUInt32LE(curCdOffset + 20);
+    const fileNameLength = zipBuffer.readUInt16LE(curCdOffset + 28);
+    const extraLength = zipBuffer.readUInt16LE(curCdOffset + 30);
+    const commentLength = zipBuffer.readUInt16LE(curCdOffset + 32);
+    const localHeaderOffset = zipBuffer.readUInt32LE(curCdOffset + 42);
+
+    const fileName = zipBuffer.toString('utf8', curCdOffset + 46, curCdOffset + 46 + fileNameLength);
+
+    const localSig = zipBuffer.readUInt32LE(localHeaderOffset);
+    if (localSig !== 0x04034b50) {
+      throw new Error(`Invalid Local Header at offset ${localHeaderOffset}`);
+    }
+    const localFileNameLen = zipBuffer.readUInt16LE(localHeaderOffset + 26);
+    const localExtraLen = zipBuffer.readUInt16LE(localHeaderOffset + 28);
+    const dataStart = localHeaderOffset + 30 + localFileNameLen + localExtraLen;
+    const compressedData = zipBuffer.subarray(dataStart, dataStart + compressedSize);
+
+    const outPath = path.join(targetDir, fileName.replace(/\//g, path.sep));
+
+    if (fileName.endsWith('/') || fileName.endsWith('\\')) {
+      fs.mkdirSync(outPath, { recursive: true });
+    } else {
+      fs.mkdirSync(path.dirname(outPath), { recursive: true });
+      let fileData: Buffer;
+      if (compressionMethod === 0) {
+        fileData = compressedData;
+      } else if (compressionMethod === 8) {
+        fileData = zlib.inflateRawSync(compressedData);
+      } else {
+        throw new Error(`Unsupported compression method ${compressionMethod} for ${fileName}`);
+      }
+      fs.writeFileSync(outPath, fileData);
+      count++;
+    }
+
+    curCdOffset += 46 + fileNameLength + extraLength + commentLength;
+  }
+
+  return count;
+}
+
+/**
  * Utility: Convert column letter to 1-based index (e.g., 'A' -> 1, 'L' -> 12, 'AB' -> 28)
  */
 export function colNameToIndex(col: string): number {
@@ -139,16 +273,53 @@ export function serialToDate(serial: number): string {
 }
 
 /**
- * Read Master Metadata
+ * Reads Master Metadata from cloud storage, local persistent fallback, or temp
  */
-function readMeta(): MasterMeta {
-  if (fs.existsSync(META_FILE_PATH)) {
-    try {
-      return JSON.parse(fs.readFileSync(META_FILE_PATH, 'utf8'));
-    } catch {
-      // Fallback
+export async function syncLatestMeta(): Promise<MasterMeta> {
+  // 1. Try Firebase Storage
+  try {
+    const metaRef = ref(storage, CANONICAL_STORAGE_META);
+    const bytes = await getBytes(metaRef);
+    if (bytes && bytes.byteLength > 0) {
+      const text = Buffer.from(bytes).toString('utf8');
+      const parsed = JSON.parse(text) as MasterMeta;
+      saveMetaLocally(parsed);
+      return parsed;
+    }
+  } catch (err) {
+    // Expected when cloud bucket is not yet provisioned
+  }
+
+  // 2. Try Local Persistent Fallback
+  if (LOCAL_PERSISTENT_DIR) {
+    const pPath = path.join(LOCAL_PERSISTENT_DIR, 'master-meta.json');
+    if (fs.existsSync(pPath)) {
+      try {
+        const text = fs.readFileSync(pPath, 'utf8');
+        const parsed = JSON.parse(text) as MasterMeta;
+        saveMetaLocally(parsed);
+        return parsed;
+      } catch (err) {}
     }
   }
+
+  // 3. Try TMP_META_PATH
+  if (fs.existsSync(TMP_META_PATH)) {
+    try {
+      return JSON.parse(fs.readFileSync(TMP_META_PATH, 'utf8'));
+    } catch (err) {}
+  }
+
+  // 4. Try bundled read-only meta template
+  if (fs.existsSync(BUNDLED_META_PATH)) {
+    try {
+      const meta = JSON.parse(fs.readFileSync(BUNDLED_META_PATH, 'utf8'));
+      saveMetaLocally(meta);
+      return meta;
+    } catch (err) {}
+  }
+
+  // Default fallback meta
   const defaultMeta: MasterMeta = {
     workbookName: 'B-19-AI Builder (1) (3).xlsx',
     batchName: 'BATCH-19 (AI Builder)',
@@ -158,81 +329,232 @@ function readMeta(): MasterMeta {
     errors: [],
     studentMappings: {},
   };
-  fs.writeFileSync(META_FILE_PATH, JSON.stringify(defaultMeta, null, 2), 'utf8');
+  saveMetaLocally(defaultMeta);
   return defaultMeta;
 }
 
 /**
- * Save Master Metadata
+ * Saves Master Metadata to local writable paths
  */
-function saveMeta(meta: MasterMeta) {
-  fs.writeFileSync(META_FILE_PATH, JSON.stringify(meta, null, 2), 'utf8');
+function saveMetaLocally(meta: MasterMeta): void {
+  ensureTmpBaseDir();
+  try {
+    fs.writeFileSync(TMP_META_PATH, JSON.stringify(meta, null, 2), 'utf8');
+  } catch (err) {}
+
+  if (LOCAL_PERSISTENT_DIR) {
+    try {
+      fs.writeFileSync(path.join(LOCAL_PERSISTENT_DIR, 'master-meta.json'), JSON.stringify(meta, null, 2), 'utf8');
+    } catch (err) {}
+  }
 }
 
 /**
- * Initialize Master Workbook environment and backup
+ * Synchronous local meta reader for in-memory / temp operations
+ */
+function readMeta(): MasterMeta {
+  if (fs.existsSync(TMP_META_PATH)) {
+    try {
+      return JSON.parse(fs.readFileSync(TMP_META_PATH, 'utf8'));
+    } catch {}
+  }
+  if (LOCAL_PERSISTENT_DIR) {
+    const pPath = path.join(LOCAL_PERSISTENT_DIR, 'master-meta.json');
+    if (fs.existsSync(pPath)) {
+      try {
+        return JSON.parse(fs.readFileSync(pPath, 'utf8'));
+      } catch {}
+    }
+  }
+  if (fs.existsSync(BUNDLED_META_PATH)) {
+    try {
+      return JSON.parse(fs.readFileSync(BUNDLED_META_PATH, 'utf8'));
+    } catch {}
+  }
+  return {
+    workbookName: 'B-19-AI Builder (1) (3).xlsx',
+    batchName: 'BATCH-19 (AI Builder)',
+    worksheetName: 'B-19-AI Builder',
+    version: 1,
+    lastSyncedAt: new Date().toISOString(),
+    errors: [],
+    studentMappings: {},
+  };
+}
+
+/**
+ * Download canonical master workbook buffer from Firebase Cloud Storage,
+ * falling back to persistent local storage or bundled seed.
+ */
+export async function downloadLatestMasterWorkbook(): Promise<Buffer> {
+  // 1. Try Firebase Storage
+  try {
+    const storageRef = ref(storage, CANONICAL_STORAGE_FILE);
+    const bytes = await getBytes(storageRef);
+    if (bytes && bytes.byteLength > 0) {
+      const buf = Buffer.from(bytes);
+      ensureTmpBaseDir();
+      fs.writeFileSync(TMP_MASTER_XLSX, buf);
+      return buf;
+    }
+  } catch (err: any) {
+    // Bucket not yet provisioned or network unreachable
+  }
+
+  // 2. Try Local Persistent Fallback Directory
+  if (LOCAL_PERSISTENT_DIR) {
+    const pPath = path.join(LOCAL_PERSISTENT_DIR, 'master-attendance.xlsx');
+    if (fs.existsSync(pPath)) {
+      try {
+        const buf = fs.readFileSync(pPath);
+        if (buf && buf.length > 0) {
+          ensureTmpBaseDir();
+          fs.writeFileSync(TMP_MASTER_XLSX, buf);
+          return buf;
+        }
+      } catch (err) {}
+    }
+  }
+
+  // 3. Try TMP_MASTER_XLSX (e.g. warm serverless container)
+  if (fs.existsSync(TMP_MASTER_XLSX)) {
+    try {
+      const buf = fs.readFileSync(TMP_MASTER_XLSX);
+      if (buf && buf.length > 0) return buf;
+    } catch (err) {}
+  }
+
+  // 4. Initial Seed from Read-Only Bundled Assets (Never modified)
+  let seedPath: string | null = null;
+  if (fs.existsSync(BUNDLED_MASTER_XLSX)) {
+    seedPath = BUNDLED_MASTER_XLSX;
+  } else if (fs.existsSync(BUNDLED_BACKUP_XLSX)) {
+    seedPath = BUNDLED_BACKUP_XLSX;
+  } else if (fs.existsSync(SOURCE_DOWNLOAD_PATH)) {
+    seedPath = SOURCE_DOWNLOAD_PATH;
+  }
+
+  if (seedPath) {
+    const buf = fs.readFileSync(seedPath);
+    ensureTmpBaseDir();
+    fs.writeFileSync(TMP_MASTER_XLSX, buf);
+
+    // Seed persistent cloud storage and local persistent fallback asynchronously
+    const meta = readMeta();
+    uploadMasterWorkbookToStorage(buf, meta).catch((err) => {
+      console.warn('[Excel Storage] Initial cloud seed notice:', err?.message);
+    });
+
+    return buf;
+  }
+
+  throw new Error('Canonical master Excel workbook template could not be found.');
+}
+
+/**
+ * Upload the master workbook and metadata to Firebase Cloud Storage
+ * and persistent storage fallback.
+ */
+export async function uploadMasterWorkbookToStorage(buffer: Buffer, meta: MasterMeta): Promise<void> {
+  // 1. Upload to Firebase Storage
+  try {
+    const storageRef = ref(storage, CANONICAL_STORAGE_FILE);
+    await uploadBytes(storageRef, buffer, {
+      contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+      customMetadata: {
+        version: String(meta.version),
+        lastSyncedAt: meta.lastSyncedAt,
+      },
+    });
+
+    const metaRef = ref(storage, CANONICAL_STORAGE_META);
+    await uploadBytes(metaRef, Buffer.from(JSON.stringify(meta, null, 2), 'utf8'), {
+      contentType: 'application/json',
+    });
+  } catch (err: any) {
+    // Cloud storage notice
+  }
+
+  // 2. Save to Local Persistent Fallback if available
+  if (LOCAL_PERSISTENT_DIR) {
+    try {
+      fs.writeFileSync(path.join(LOCAL_PERSISTENT_DIR, 'master-attendance.xlsx'), buffer);
+      fs.writeFileSync(path.join(LOCAL_PERSISTENT_DIR, 'master-meta.json'), JSON.stringify(meta, null, 2), 'utf8');
+    } catch (err) {
+      console.warn('[Excel Storage] Note saving to persistent fallback directory:', err);
+    }
+  }
+
+  // 3. Always keep local tmp cache updated
+  ensureTmpBaseDir();
+  try {
+    fs.writeFileSync(TMP_MASTER_XLSX, buffer);
+    fs.writeFileSync(TMP_META_PATH, JSON.stringify(meta, null, 2), 'utf8');
+  } catch (err) {}
+}
+
+/**
+ * Synchronize workspace from storage before applying modifications
+ */
+async function syncFromStorage(): Promise<void> {
+  ensureTmpBaseDir();
+  try {
+    const storageRef = ref(storage, CANONICAL_STORAGE_FILE);
+    const bytes = await getBytes(storageRef);
+    if (bytes && bytes.byteLength > 0) {
+      const buf = Buffer.from(bytes);
+      fs.writeFileSync(TMP_MASTER_XLSX, buf);
+      extractZipBuffer(buf, TMP_UNPACKED_DIR);
+      await syncLatestMeta();
+      return;
+    }
+  } catch (err) {}
+
+  // If TMP_MASTER_XLSX does not exist, download or seed
+  if (!fs.existsSync(TMP_MASTER_XLSX)) {
+    const buf = await downloadLatestMasterWorkbook();
+    extractZipBuffer(buf, TMP_UNPACKED_DIR);
+    return;
+  }
+
+  // Ensure unpacked sheet exists in TMP_UNPACKED_DIR
+  const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
+  if (!fs.existsSync(sheet1Path) && fs.existsSync(TMP_MASTER_XLSX)) {
+    const zipBuffer = fs.readFileSync(TMP_MASTER_XLSX);
+    extractZipBuffer(zipBuffer, TMP_UNPACKED_DIR);
+  }
+}
+
+/**
+ * Initialize Master Workbook environment safely in os.tmpdir()
  */
 export async function ensureMasterWorkbook(): Promise<void> {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
-  } catch {
-    // In read-only serverless environment, ignore mkdir errors
+  ensureTmpBaseDir();
+
+  if (!fs.existsSync(TMP_MASTER_XLSX)) {
+    await downloadLatestMasterWorkbook();
   }
 
-  // If master-attendance.xlsx does not exist, restore from backup or source
-  if (!fs.existsSync(MASTER_XLSX_PATH)) {
-    if (fs.existsSync(INITIAL_BACKUP_PATH)) {
-      try {
-        fs.copyFileSync(INITIAL_BACKUP_PATH, MASTER_XLSX_PATH);
-      } catch {
-        // read-only fs
-      }
-    } else if (fs.existsSync(SOURCE_DOWNLOAD_PATH)) {
-      try {
-        fs.copyFileSync(SOURCE_DOWNLOAD_PATH, MASTER_XLSX_PATH);
-      } catch {
-        // read-only fs
-      }
-    }
-  }
-
-  // Ensure initial backup exists
-  if (!fs.existsSync(INITIAL_BACKUP_PATH) && fs.existsSync(MASTER_XLSX_PATH)) {
+  const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
+  if (!fs.existsSync(sheet1Path) && fs.existsSync(TMP_MASTER_XLSX)) {
     try {
-      fs.copyFileSync(MASTER_XLSX_PATH, INITIAL_BACKUP_PATH);
-    } catch {
-      // read-only fs
-    }
-  }
-
-  // Ensure unpacked directory exists
-  const sheet1Path = path.join(UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
-  if (!fs.existsSync(sheet1Path) && fs.existsSync(MASTER_XLSX_PATH)) {
-    try {
-      const { execSync } = require('child_process');
-      if (process.platform === 'win32') {
-        execSync(
-          `powershell -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('${MASTER_XLSX_PATH}', '${UNPACKED_DIR}')"`,
-          { stdio: 'ignore' }
-        );
-      } else {
-        // Linux / serverless environment
-        execSync(`unzip -q -o "${MASTER_XLSX_PATH}" -d "${UNPACKED_DIR}"`, { stdio: 'ignore' });
-      }
+      const zipBuffer = fs.readFileSync(TMP_MASTER_XLSX);
+      extractZipBuffer(zipBuffer, TMP_UNPACKED_DIR);
     } catch (extractErr) {
       console.warn('[Excel Master] Note during initial extraction:', extractErr);
     }
   }
 
-  readMeta();
+  await syncLatestMeta();
 }
 
 /**
- * Rebuild master-attendance.xlsx from UNPACKED_DIR atomically
+ * Rebuild master-attendance.xlsx from TMP_UNPACKED_DIR atomically in os.tmpdir()
+ * and upload to cloud storage.
  */
 async function rebuildMasterXlsx(): Promise<void> {
-  const tmpOut = path.join(DATA_DIR, `master-attendance.${Date.now()}.tmp`);
+  ensureTmpBaseDir();
+  const tmpOut = path.join(TMP_BASE_DIR, `rebuild-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.tmp`);
   const output = fs.createWriteStream(tmpOut);
   const archive = archiver('zip', { zlib: { level: 9 } });
 
@@ -240,28 +562,35 @@ async function rebuildMasterXlsx(): Promise<void> {
     output.on('close', () => resolve());
     archive.on('error', (err: unknown) => reject(err));
     archive.pipe(output);
-    archive.directory(UNPACKED_DIR, false);
+    archive.directory(TMP_UNPACKED_DIR, false);
     archive.finalize();
   });
 
-  // Atomic file replace
-  if (fs.existsSync(MASTER_XLSX_PATH)) {
-    fs.unlinkSync(MASTER_XLSX_PATH);
+  const buffer = fs.readFileSync(tmpOut);
+
+  // Replace TMP_MASTER_XLSX atomically
+  if (fs.existsSync(TMP_MASTER_XLSX)) {
+    try {
+      fs.unlinkSync(TMP_MASTER_XLSX);
+    } catch {}
   }
-  fs.renameSync(tmpOut, MASTER_XLSX_PATH);
+  fs.renameSync(tmpOut, TMP_MASTER_XLSX);
 
   // Update metadata
-  const meta = readMeta();
+  const meta = await syncLatestMeta();
   meta.version += 1;
   meta.lastSyncedAt = new Date().toISOString();
-  saveMeta(meta);
+  saveMetaLocally(meta);
+
+  // Upload to Firebase Storage and persistent fallback
+  await uploadMasterWorkbookToStorage(buffer, meta);
 }
 
 /**
- * Load Shared Strings
+ * Load Shared Strings from TMP_UNPACKED_DIR
  */
 function loadSharedStrings(): string[] {
-  const ssPath = path.join(UNPACKED_DIR, 'xl', 'sharedStrings.xml');
+  const ssPath = path.join(TMP_UNPACKED_DIR, 'xl', 'sharedStrings.xml');
   if (!fs.existsSync(ssPath)) return [];
   const xml = fs.readFileSync(ssPath, 'utf8');
   const strings: string[] = [];
@@ -598,8 +927,8 @@ function recalculateStudentRow(
 export async function getMasterWorkbookInfo(): Promise<MasterWorkbookInfo> {
   return lock.acquire('master-workbook', async () => {
     await ensureMasterWorkbook();
-    const meta = readMeta();
-    const sheet1Path = path.join(UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
+    const meta = await syncLatestMeta();
+    const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
     const sheetXml = fs.readFileSync(sheet1Path, 'utf8');
     const sharedStrings = loadSharedStrings();
 
@@ -638,7 +967,7 @@ export async function getMasterAttendanceForDate(dateStr: string): Promise<{
 }> {
   return lock.acquire('master-workbook', async () => {
     await ensureMasterWorkbook();
-    const sheet1Path = path.join(UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
+    const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
     const sheetXml = fs.readFileSync(sheet1Path, 'utf8');
     const sharedStrings = loadSharedStrings();
 
@@ -721,8 +1050,8 @@ export async function recordStudentAttendanceInMaster(
   status: 'P' | 'A' | 'L' = 'P'
 ): Promise<{ success: boolean; row: number; column: string; alreadyRecorded: boolean; message: string }> {
   return lock.acquire('master-workbook', async () => {
-    await ensureMasterWorkbook();
-    const sheet1Path = path.join(UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
+    await syncFromStorage();
+    const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
     let sheetXml = fs.readFileSync(sheet1Path, 'utf8');
     const sharedStrings = loadSharedStrings();
 
@@ -733,10 +1062,10 @@ export async function recordStudentAttendanceInMaster(
     const matched = matchStudentToExcelRow(student, students);
     if (!matched) {
       const err = `Student matching error: Could not identify Excel row for student '${student.fullName}' (${student.studentId}).`;
-      const meta = readMeta();
+      const meta = await syncLatestMeta();
       if (!meta.errors.includes(err)) {
         meta.errors.push(err);
-        saveMeta(meta);
+        saveMetaLocally(meta);
       }
       throw new Error(err);
     }
@@ -802,11 +1131,11 @@ export async function recordStudentAttendanceInMaster(
     const allDateCols = Object.keys(dateInfo.colDateMap);
     rowContent = recalculateStudentRow(rowContent, matched.row, allDateCols, sharedStrings);
 
-    // 6. Write back to sheetXml
+    // 6. Write back to sheetXml in TMP_UNPACKED_DIR
     sheetXml = sheetXml.replace(rowRegex, `${rowMatch[1]}${rowContent}${rowMatch[3]}`);
     fs.writeFileSync(sheet1Path, sheetXml, 'utf8');
 
-    // 7. Atomically rebuild master-attendance.xlsx
+    // 7. Atomically rebuild master-attendance.xlsx and upload to cloud storage
     await rebuildMasterXlsx();
 
     return {
@@ -841,8 +1170,8 @@ export async function finalizeDailyAttendanceInMaster(
   }
 
   return lock.acquire('master-workbook', async () => {
-    await ensureMasterWorkbook();
-    const sheet1Path = path.join(UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
+    await syncFromStorage();
+    const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
     let sheetXml = fs.readFileSync(sheet1Path, 'utf8');
     const sharedStrings = loadSharedStrings();
 
@@ -900,7 +1229,7 @@ export async function finalizeDailyAttendanceInMaster(
 
     fs.writeFileSync(sheet1Path, sheetXml, 'utf8');
     await rebuildMasterXlsx();
-    const meta = readMeta();
+    const meta = await syncLatestMeta();
 
     return {
       success: true,
@@ -936,8 +1265,8 @@ export async function correctAttendanceEntryInMaster(params: {
   }
 
   return lock.acquire('master-workbook', async () => {
-    await ensureMasterWorkbook();
-    const sheet1Path = path.join(UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
+    await syncFromStorage();
+    const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
     let sheetXml = fs.readFileSync(sheet1Path, 'utf8');
     const sharedStrings = loadSharedStrings();
 
@@ -979,7 +1308,7 @@ export async function correctAttendanceEntryInMaster(params: {
 
     const students = parseStudents(sheetXml, sharedStrings);
     const studentObj = students.find((s) => s.row === row);
-    const meta = readMeta();
+    const meta = await syncLatestMeta();
 
     return {
       success: true,
@@ -992,17 +1321,40 @@ export async function correctAttendanceEntryInMaster(params: {
 }
 
 /**
- * Public: Get path to canonical master workbook file for download
+ * Public: Get path to canonical master workbook file for local access
  */
 export function getMasterWorkbookFilePath(): string {
-  if (fs.existsSync(MASTER_XLSX_PATH)) {
-    return MASTER_XLSX_PATH;
+  if (fs.existsSync(TMP_MASTER_XLSX)) {
+    return TMP_MASTER_XLSX;
   }
-  if (fs.existsSync(INITIAL_BACKUP_PATH)) {
-    return INITIAL_BACKUP_PATH;
+  if (LOCAL_PERSISTENT_DIR) {
+    const pPath = path.join(LOCAL_PERSISTENT_DIR, 'master-attendance.xlsx');
+    if (fs.existsSync(pPath)) return pPath;
+  }
+  if (fs.existsSync(BUNDLED_MASTER_XLSX)) {
+    return BUNDLED_MASTER_XLSX;
+  }
+  if (fs.existsSync(BUNDLED_BACKUP_XLSX)) {
+    return BUNDLED_BACKUP_XLSX;
   }
   if (fs.existsSync(SOURCE_DOWNLOAD_PATH)) {
     return SOURCE_DOWNLOAD_PATH;
   }
   throw new Error('Master Excel workbook B-19-AI Builder (1) (3).xlsx not found.');
+}
+
+/**
+ * Public: Get canonical master workbook buffer and filename for HTTP download
+ * Downloads the latest version from persistent storage.
+ */
+export async function getMasterWorkbookBufferForDownload(): Promise<{ buffer: Buffer; filename: string }> {
+  return lock.acquire('master-workbook', async () => {
+    await ensureMasterWorkbook();
+    const buffer = await downloadLatestMasterWorkbook();
+    const meta = await syncLatestMeta();
+    return {
+      buffer,
+      filename: meta.workbookName || 'B-19-AI Builder (1) (3).xlsx',
+    };
+  });
 }

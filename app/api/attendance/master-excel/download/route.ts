@@ -1,6 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import fs from 'fs';
-import { getMasterWorkbookFilePath, ensureMasterWorkbook } from '@/lib/excel-master-service';
+import { getMasterWorkbookBufferForDownload } from '@/lib/excel-master-service';
 import { isAuthorizedAdmin } from '@/lib/admin-config';
 
 export async function GET(request: NextRequest) {
@@ -15,17 +14,8 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    await ensureMasterWorkbook();
-    const filePath = getMasterWorkbookFilePath();
+    const { buffer: fileBuffer, filename } = await getMasterWorkbookBufferForDownload();
 
-    if (!fs.existsSync(filePath)) {
-      return NextResponse.json(
-        { error: 'Master workbook file B-19-AI Builder (1) (3).xlsx not found on server.' },
-        { status: 404 }
-      );
-    }
-
-    const fileBuffer = fs.readFileSync(filePath);
     if (!fileBuffer || fileBuffer.length === 0) {
       return NextResponse.json(
         { error: 'Master workbook file is empty or corrupted.' },
@@ -33,7 +23,6 @@ export async function GET(request: NextRequest) {
       );
     }
 
-    const filename = 'B-19-AI Builder (1) (3).xlsx';
     const encodedFilename = encodeURIComponent(filename);
 
     return new NextResponse(new Uint8Array(fileBuffer), {
