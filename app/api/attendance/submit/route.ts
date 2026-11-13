@@ -5,7 +5,7 @@ import { db } from '@/lib/firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
 import { AttendanceRecord, ClassroomQRPayload } from '@/lib/types';
 import { recordStudentAttendanceInMaster } from '@/lib/excel-master-service';
-import { getQRAccessStatus } from '@/lib/qr-challenge-service';
+import { getQRAccessStatus, isQRAccessEnabled, QR_ACCESS_DISABLED_MESSAGE } from '@/lib/qr-challenge-service';
 import { verifyStudentLocation, logLocationIncident } from '@/lib/geofence-service';
 
 export async function POST(request: NextRequest) {
@@ -29,12 +29,12 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // 2. CRITICAL BACKEND RULE: Check Admin QR Access ON/OFF status first
-    const qrAccessStatus = await getQRAccessStatus();
-    if (qrAccessStatus === 'DISABLED') {
+    // 2. CRITICAL BACKEND RULE: Check Admin QR Access ON/OFF status first (authoritative database & memory)
+    const qrAccessEnabled = await isQRAccessEnabled(true);
+    if (!qrAccessEnabled) {
       return NextResponse.json(
         {
-          error: 'Attendance is currently disabled by the administrator. Please wait until the administrator enables attendance.',
+          error: QR_ACCESS_DISABLED_MESSAGE,
           errorType: 'QR_ACCESS_DISABLED',
           isQrDisabled: true,
         },
@@ -153,8 +153,10 @@ export async function POST(request: NextRequest) {
       console.warn('Firestore duplicate check notice:', dbReadErr);
     }
 
-    // 9. Write verified attendance record to Canonical Master Excel Workbook
-    let masterExcelResult;
+    // 9. Synchronize attendance record with Canonical Master Excel Register
+    // Note: Excel sync has separate status from authoritative database attendance
+    let excelSyncStatus: 'SYNCED' | 'PENDING' = 'PENDING';
+    let masterExcelResult = null;
     try {
       masterExcelResult = await recordStudentAttendanceInMaster(
         {
@@ -165,19 +167,26 @@ export async function POST(request: NextRequest) {
         classDate,
         'P'
       );
+      excelSyncStatus = 'SYNCED';
     } catch (excelErr) {
-      console.error('Master Excel synchronization error:', excelErr);
+      console.warn('[Submit] Master Excel synchronization deferred to daily finalization:', excelErr);
+      excelSyncStatus = 'PENDING';
+    }
+
+    // 10. CRITICAL RACE-CONDITION CHECK: Verify QR Access immediately before committing
+    const raceCheckEnabled = await isQRAccessEnabled(true);
+    if (!raceCheckEnabled) {
       return NextResponse.json(
         {
-          error: `Attendance verification failed in master register: ${
-            excelErr instanceof Error ? excelErr.message : 'Master workbook update failed.'
-          }`,
+          error: QR_ACCESS_DISABLED_MESSAGE,
+          errorType: 'QR_ACCESS_DISABLED',
+          isQrDisabled: true,
         },
-        { status: 500 }
+        { status: 403 }
       );
     }
 
-    // 10. Write verified attendance record to database with trusted timestamp & geolocation audit
+    // 11. Prepare schema-compliant authoritative attendance record
     const nowIso = new Date().toISOString();
     const newRecord: AttendanceRecord = {
       id: attendanceDocId,
@@ -193,28 +202,59 @@ export async function POST(request: NextRequest) {
       submittedAt: nowIso,
     };
 
-    try {
-      await setDoc(attendanceRef, {
-        ...newRecord,
-        location: {
-          latitude: location.latitude,
-          longitude: location.longitude,
-          accuracy: location.accuracy,
-          distanceMeters: locResult.distanceMeters,
-        },
-      });
-    } catch (dbWriteErr) {
-      console.warn('Firestore attendance write notice (offline or rules):', dbWriteErr);
+    // If student passed Firebase Auth ID token, write to Firestore REST API with student's authenticated context
+    const authHeader = request.headers.get('Authorization') || request.headers.get('authorization');
+    let backendDbConfirmed = false;
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const idToken = authHeader.split('Bearer ')[1].trim();
+      if (idToken) {
+        try {
+          const firestoreUrl = `https://firestore.googleapis.com/v1/projects/asdc-attendance/databases/(default)/documents/attendance?documentId=${attendanceDocId}`;
+          const fields: Record<string, any> = {
+            id: { stringValue: newRecord.id },
+            studentUid: { stringValue: newRecord.studentUid },
+            studentId: { stringValue: newRecord.studentId },
+            studentName: { stringValue: newRecord.studentName },
+            studentEmail: { stringValue: newRecord.studentEmail },
+            classDate: { stringValue: newRecord.classDate },
+            batchId: { stringValue: newRecord.batchId },
+            status: { stringValue: newRecord.status },
+            source: { stringValue: newRecord.source },
+            verifiedAt: { stringValue: newRecord.verifiedAt },
+            submittedAt: { stringValue: newRecord.submittedAt || nowIso },
+          };
+          const restRes = await fetch(firestoreUrl, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${idToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ fields }),
+          });
+          if (restRes.ok) {
+            backendDbConfirmed = true;
+          } else {
+            const errBody = await restRes.text();
+            console.warn('[Submit] Firestore REST direct write note:', errBody);
+          }
+        } catch (restErr) {
+          console.warn('[Submit] Firestore REST API write notice:', restErr);
+        }
+      }
     }
 
     const isAlreadyRecorded = Boolean(masterExcelResult?.alreadyRecorded);
 
     return NextResponse.json({
       success: true,
+      authorized: true,
       alreadyRecorded: isAlreadyRecorded,
+      backendDbConfirmed,
+      attendanceStatus: 'RECORDED',
+      excelSyncStatus,
       message: isAlreadyRecorded
-        ? `Attendance already recorded for today (${classDate}) as PRESENT in Master Excel register.`
-        : `Successfully marked PRESENT in Master Excel Register and Database for ${classDate} at ${istInfo.timeString} IST. Distance from ASDC: ${Math.round(
+        ? `Attendance already recorded for today (${classDate}) as PRESENT.`
+        : `Successfully marked PRESENT for ${classDate} at ${istInfo.timeString} IST. Distance: ${Math.round(
             locResult.distanceMeters
           )}m.`,
       record: newRecord,

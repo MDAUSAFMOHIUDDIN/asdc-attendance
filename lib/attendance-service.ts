@@ -395,7 +395,11 @@ export async function fetchMasterAttendanceForDate(adminEmail: string, date: str
 /**
  * Finalize daily attendance in Canonical Master Excel Workbook (Admin action)
  */
-export async function finalizeMasterDailyAttendance(adminEmail: string, date: string): Promise<{
+export async function finalizeMasterDailyAttendance(
+  adminEmail: string,
+  date: string,
+  attendanceRecords?: AttendanceRecord[]
+): Promise<{
   success: boolean;
   message: string;
   result: {
@@ -405,10 +409,21 @@ export async function finalizeMasterDailyAttendance(adminEmail: string, date: st
     version: number;
   };
 }> {
+  let idToken: string | null = null;
+  try {
+    const { auth } = await import('./firebase');
+    if (auth.currentUser) {
+      idToken = await auth.currentUser.getIdToken();
+    }
+  } catch {}
+
   const res = await fetch('/api/attendance/master-excel/finalize', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ adminEmail, date }),
+    headers: {
+      'Content-Type': 'application/json',
+      ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+    },
+    body: JSON.stringify({ adminEmail, date, attendanceRecords }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: 'Finalization failed' }));

@@ -15,17 +15,48 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    let targetStatus: QRAccessStatus = 'ENABLED';
-    if (status) {
-      targetStatus = status === 'ENABLED' ? 'ENABLED' : 'DISABLED';
+    let targetEnabled = true;
+    if (typeof body.qrAccessEnabled === 'boolean') {
+      targetEnabled = body.qrAccessEnabled;
+    } else if (status) {
+      targetEnabled = status === 'ENABLED';
     } else if (activate !== undefined) {
-      targetStatus = activate ? 'ENABLED' : 'DISABLED';
+      targetEnabled = Boolean(activate);
     }
 
-    const result = await setQRAccessStatus(adminEmail, targetStatus);
+    const result = await setQRAccessStatus(adminEmail, targetEnabled);
+
+    // If admin passed Firebase Auth ID Token, also sync directly with Firestore REST API
+    const authHeader = request.headers.get('Authorization') || request.headers.get('authorization');
+    if (authHeader && authHeader.startsWith('Bearer ')) {
+      const idToken = authHeader.split('Bearer ')[1].trim();
+      if (idToken) {
+        try {
+          const firestoreUrl = `https://firestore.googleapis.com/v1/projects/asdc-attendance/databases/(default)/documents/settings/qr_access`;
+          await fetch(firestoreUrl, {
+            method: 'PATCH',
+            headers: {
+              'Authorization': `Bearer ${idToken}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              fields: {
+                qrAccessEnabled: { booleanValue: targetEnabled },
+                status: { stringValue: targetEnabled ? 'ENABLED' : 'DISABLED' },
+                updatedAt: { stringValue: result.updatedAt },
+                updatedBy: { stringValue: adminEmail },
+              },
+            }),
+          });
+        } catch (restErr) {
+          console.warn('[Toggle QR API] Firestore REST sync notice:', restErr);
+        }
+      }
+    }
 
     return NextResponse.json({
       success: true,
+      qrAccessEnabled: result.qrAccessEnabled,
       status: result.status,
       qrAccessStatus: result.status,
       updatedAt: result.updatedAt,

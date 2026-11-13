@@ -22,9 +22,11 @@ import {
   Navigation,
 } from 'lucide-react';
 import { StudentProfile, AttendanceRecord, ClassroomQRPayload } from '@/lib/types';
-import { INSTITUTE_CONFIG } from '@/lib/admin-config';
+import { INSTITUTE_CONFIG, QR_ACCESS_DISABLED_MESSAGE } from '@/lib/admin-config';
 import { buildClassroomQRPayload } from '@/lib/qr-generator';
 import { formatDisplayDate, formatDisplayTimestamp, getISTTimeInfo } from '@/lib/date-utils';
+import { auth, db } from '@/lib/firebase';
+import { doc, getDoc, setDoc, onSnapshot } from 'firebase/firestore';
 
 export type ScannerLifecycleState =
   | 'idle'
@@ -244,6 +246,39 @@ export function QRScannerModal({
     }
   }, []);
 
+  // Real-Time Database Listener: Classroom QR Access ON/OFF state
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    try {
+      const docRef = doc(db, 'settings', 'qr_access');
+      unsubscribe = onSnapshot(
+        docRef,
+        (snap) => {
+          if (snap.exists()) {
+            const data = snap.data();
+            const isEnabled =
+              typeof data?.qrAccessEnabled === 'boolean'
+                ? data.qrAccessEnabled
+                : data?.status === 'ENABLED';
+            if (!isEnabled) {
+              stopCameraResources();
+              setErrorType('QR_DISABLED');
+              setErrorMessage(QR_ACCESS_DISABLED_MESSAGE);
+              setScannerState('error');
+            }
+          }
+        },
+        (err) => console.warn('QR scanner access listener note:', err)
+      );
+    } catch (err) {
+      console.warn('Could not initialize scanner QR access listener:', err);
+    }
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [stopCameraResources]);
+
   // Show a non-fatal warning badge over the live camera preview
   const showScanWarning = useCallback((message: string) => {
     setScanWarning(message);
@@ -390,9 +425,22 @@ export function QRScannerModal({
         const curStudent = studentRef.current;
         console.log('[ASDC Scanner] Valid QR verified. Submitting attendance for:', curStudent.studentId);
 
+        // Get Firebase Auth ID Token for authoritative verified submission
+        let idToken: string | null = null;
+        try {
+          if (auth.currentUser) {
+            idToken = await auth.currentUser.getIdToken();
+          }
+        } catch {
+          // Token acquisition fallback
+        }
+
         const res = await fetch('/api/attendance/submit', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+          },
           body: JSON.stringify({
             studentUid: curStudent.uid,
             studentId: curStudent.studentId,
@@ -424,7 +472,7 @@ export function QRScannerModal({
           return;
         }
 
-        // Attendance recorded! Stop camera resources on final success
+        // Attendance authorized by backend! Stop camera resources
         stopCameraResources();
 
         if (data.alreadyRecorded) {
@@ -433,12 +481,35 @@ export function QRScannerModal({
           if (data.record) {
             onAttendanceSuccessRef.current(data.record);
           }
-        } else {
+          return;
+        }
+
+        // CRITICAL REQUIREMENT: Write attendance record to authoritative production database
+        // and wait for successful database confirmation before displaying success to student.
+        try {
+          const attendanceRef = doc(db, 'attendance', data.record.id);
+          await setDoc(attendanceRef, data.record);
+
+          // Verify genuine database confirmation
+          const snap = await getDoc(attendanceRef);
+          if (!snap.exists()) {
+            throw new Error('Database write confirmation failed: Record not found in authoritative database.');
+          }
+
           setSuccessRecord(data.record);
           setScannerState('success');
           if (data.record) {
             onAttendanceSuccessRef.current(data.record);
           }
+        } catch (dbErr: any) {
+          console.error('[ASDC Scanner] Database commit error:', dbErr);
+          setErrorType('GENERIC');
+          setErrorMessage(
+            `Database confirmation error: ${
+              dbErr?.message || 'Attendance record could not be confirmed in database'
+            }. Attendance was not recorded.`
+          );
+          setScannerState('error');
         }
       } catch (err: any) {
         console.error('[ASDC Scanner] Attendance processing error:', err);
@@ -1233,7 +1304,7 @@ export function QRScannerModal({
                 {errorType === 'LOCATION_OUTSIDE'
                   ? 'Outside ASDC Institute Campus'
                   : errorType === 'QR_DISABLED'
-                  ? 'Classroom Attendance Disabled'
+                  ? 'ADMIN HAS DISABLED ATTENDANCE ACCESS'
                   : errorType === 'LOCATION_DENIED'
                   ? 'Location Permission Required'
                   : errorType === 'LOCATION_ACCURACY'
@@ -1253,13 +1324,30 @@ export function QRScannerModal({
                   : 'Scanner Notice'}
               </h4>
 
-              <p className="text-xs text-slate-600 leading-relaxed mb-3.5 max-w-xs font-medium">
-                {errorMessage}
-              </p>
+              <div className="text-xs leading-relaxed mb-4 max-w-sm font-medium">
+                {errorType === 'QR_DISABLED' ? (
+                  <div className="bg-rose-50 border border-rose-300 rounded-xl p-3.5 text-rose-950 font-bold text-center shadow-xs">
+                    {QR_ACCESS_DISABLED_MESSAGE}
+                  </div>
+                ) : (
+                  <p className="text-slate-600">{errorMessage}</p>
+                )}
+              </div>
 
               {/* Action Buttons */}
               <div className="w-full space-y-2">
-                {errorType === 'LOCATION_OUTSIDE' || errorType === 'LOCATION_DENIED' || errorType === 'LOCATION_ACCURACY' ? (
+                {errorType === 'QR_DISABLED' ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      stopCameraResources();
+                      onCloseRef.current();
+                    }}
+                    className="w-full py-2.5 bg-slate-900 hover:bg-slate-800 text-white font-bold text-xs rounded-xl shadow-md transition"
+                  >
+                    Close Scanner
+                  </button>
+                ) : errorType === 'LOCATION_OUTSIDE' || errorType === 'LOCATION_DENIED' || errorType === 'LOCATION_ACCURACY' ? (
                   <button
                     type="button"
                     onClick={async () => {
@@ -1282,21 +1370,25 @@ export function QRScannerModal({
                   </button>
                 )}
 
-                <input
-                  type="file"
-                  accept="image/*"
-                  ref={fileInputRef}
-                  onChange={handleImageFileSelect}
-                  className="hidden"
-                />
-                <button
-                  type="button"
-                  onClick={() => fileInputRef.current?.click()}
-                  className="w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-xs rounded-xl flex items-center justify-center gap-2 border border-slate-300 transition"
-                >
-                  <Upload className="w-3.5 h-3.5" />
-                  Upload Photo of Classroom QR
-                </button>
+                {errorType !== 'QR_DISABLED' && (
+                  <>
+                    <input
+                      type="file"
+                      accept="image/*"
+                      ref={fileInputRef}
+                      onChange={handleImageFileSelect}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => fileInputRef.current?.click()}
+                      className="w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-bold text-xs rounded-xl flex items-center justify-center gap-2 border border-slate-300 transition"
+                    >
+                      <Upload className="w-3.5 h-3.5" />
+                      Upload Photo of Classroom QR
+                    </button>
+                  </>
+                )}
               </div>
             </div>
           )}

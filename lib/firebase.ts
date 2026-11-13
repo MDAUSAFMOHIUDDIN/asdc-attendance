@@ -4,6 +4,9 @@ import { getFirestore, doc, getDocFromServer } from 'firebase/firestore';
 import { getStorage } from 'firebase/storage';
 import firebaseConfig from '../firebase-applet-config.json' with { type: 'json' };
 
+export const FIREBASE_CONFIG = firebaseConfig;
+export { firebaseConfig };
+
 export const app = !getApps().length ? initializeApp(firebaseConfig) : getApp();
 
 // CRITICAL: The app requires firestoreDatabaseId for custom provisioned databases

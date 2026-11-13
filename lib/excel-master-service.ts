@@ -25,8 +25,10 @@ import zlib from 'zlib';
 import archiver from 'archiver';
 import AsyncLock from 'async-lock';
 import { SOLE_ADMIN_EMAIL, isAuthorizedAdmin } from './admin-config.ts';
-import { storage } from './firebase.ts';
+import { storage, db, FIREBASE_CONFIG } from './firebase.ts';
 import { ref, getBytes, uploadBytes } from 'firebase/storage';
+import { doc, getDoc, setDoc } from 'firebase/firestore';
+import type { AttendanceRecord } from './types.ts';
 
 const lock = new AsyncLock();
 
@@ -383,11 +385,30 @@ function readMeta(): MasterMeta {
 }
 
 /**
- * Download canonical master workbook buffer from Firebase Cloud Storage,
- * falling back to persistent local storage or bundled seed.
+ * Download canonical master workbook buffer from persistent cloud storage (Firestore settings/master_workbook),
+ * falling back to Firebase Storage, local persistent storage, or bundled seed.
  */
 export async function downloadLatestMasterWorkbook(): Promise<Buffer> {
-  // 1. Try Firebase Storage
+  // 1. Try Firestore persistent document settings/master_workbook (100% persistent across Vercel serverless containers)
+  try {
+    const docRef = doc(db, 'settings', 'master_workbook');
+    const snap = await getDoc(docRef);
+    if (snap.exists()) {
+      const data = snap.data();
+      if (data?.base64 && typeof data.base64 === 'string') {
+        const buf = Buffer.from(data.base64, 'base64');
+        if (buf.length > 0 && buf.readUInt32LE(0) === 0x04034b50) {
+          ensureTmpBaseDir();
+          fs.writeFileSync(TMP_MASTER_XLSX, buf);
+          return buf;
+        }
+      }
+    }
+  } catch (err) {
+    // Firestore read notice
+  }
+
+  // 2. Try Firebase Storage
   try {
     const storageRef = ref(storage, CANONICAL_STORAGE_FILE);
     const bytes = await getBytes(storageRef);
@@ -401,7 +422,7 @@ export async function downloadLatestMasterWorkbook(): Promise<Buffer> {
     // Bucket not yet provisioned or network unreachable
   }
 
-  // 2. Try Local Persistent Fallback Directory
+  // 3. Try Local Persistent Fallback Directory
   if (LOCAL_PERSISTENT_DIR) {
     const pPath = path.join(LOCAL_PERSISTENT_DIR, 'master-attendance.xlsx');
     if (fs.existsSync(pPath)) {
@@ -416,7 +437,7 @@ export async function downloadLatestMasterWorkbook(): Promise<Buffer> {
     }
   }
 
-  // 3. Try TMP_MASTER_XLSX (e.g. warm serverless container)
+  // 4. Try TMP_MASTER_XLSX (e.g. warm serverless container)
   if (fs.existsSync(TMP_MASTER_XLSX)) {
     try {
       const buf = fs.readFileSync(TMP_MASTER_XLSX);
@@ -424,7 +445,7 @@ export async function downloadLatestMasterWorkbook(): Promise<Buffer> {
     } catch (err) {}
   }
 
-  // 4. Initial Seed from Read-Only Bundled Assets (Never modified)
+  // 5. Initial Seed from Read-Only Bundled Assets (Never modified)
   let seedPath: string | null = null;
   if (fs.existsSync(BUNDLED_MASTER_XLSX)) {
     seedPath = BUNDLED_MASTER_XLSX;
@@ -452,11 +473,58 @@ export async function downloadLatestMasterWorkbook(): Promise<Buffer> {
 }
 
 /**
- * Upload the master workbook and metadata to Firebase Cloud Storage
+ * Upload the master workbook and metadata to persistent cloud storage (Firestore + Firebase Storage)
  * and persistent storage fallback.
  */
-export async function uploadMasterWorkbookToStorage(buffer: Buffer, meta: MasterMeta): Promise<void> {
-  // 1. Upload to Firebase Storage
+export async function uploadMasterWorkbookToStorage(
+  buffer: Buffer,
+  meta: MasterMeta,
+  idToken?: string | null
+): Promise<void> {
+  // 1. Save to Firestore settings/master_workbook (Guarantees persistence across Vercel serverless containers)
+  try {
+    const docRef = doc(db, 'settings', 'master_workbook');
+    await setDoc(
+      docRef,
+      {
+        base64: buffer.toString('base64'),
+        version: meta.version,
+        lastSyncedAt: meta.lastSyncedAt,
+        workbookName: meta.workbookName,
+        updatedAt: new Date().toISOString(),
+      },
+      { merge: true }
+    );
+  } catch (fsErr) {
+    console.warn('[Excel Storage] Firestore master workbook write notice:', fsErr);
+  }
+
+  // 1b. If idToken is provided, also push via authenticated Firestore REST API
+  if (idToken) {
+    try {
+      const restUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/settings/master_workbook`;
+      await fetch(restUrl, {
+        method: 'PATCH',
+        headers: {
+          Authorization: `Bearer ${idToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          fields: {
+            base64: { stringValue: buffer.toString('base64') },
+            version: { integerValue: String(meta.version) },
+            lastSyncedAt: { stringValue: meta.lastSyncedAt },
+            workbookName: { stringValue: meta.workbookName },
+            updatedAt: { stringValue: new Date().toISOString() },
+          },
+        }),
+      });
+    } catch (restErr) {
+      console.warn('[Excel Storage] REST upload note:', restErr);
+    }
+  }
+
+  // 2. Upload to Firebase Storage
   try {
     const storageRef = ref(storage, CANONICAL_STORAGE_FILE);
     await uploadBytes(storageRef, buffer, {
@@ -475,7 +543,7 @@ export async function uploadMasterWorkbookToStorage(buffer: Buffer, meta: Master
     // Cloud storage notice
   }
 
-  // 2. Save to Local Persistent Fallback if available
+  // 3. Save to Local Persistent Fallback if available
   if (LOCAL_PERSISTENT_DIR) {
     try {
       fs.writeFileSync(path.join(LOCAL_PERSISTENT_DIR, 'master-attendance.xlsx'), buffer);
@@ -485,7 +553,7 @@ export async function uploadMasterWorkbookToStorage(buffer: Buffer, meta: Master
     }
   }
 
-  // 3. Always keep local tmp cache updated
+  // 4. Always keep local tmp cache updated
   ensureTmpBaseDir();
   try {
     fs.writeFileSync(TMP_MASTER_XLSX, buffer);
@@ -552,7 +620,7 @@ export async function ensureMasterWorkbook(): Promise<void> {
  * Rebuild master-attendance.xlsx from TMP_UNPACKED_DIR atomically in os.tmpdir()
  * and upload to cloud storage.
  */
-async function rebuildMasterXlsx(): Promise<void> {
+async function rebuildMasterXlsx(idToken?: string | null): Promise<void> {
   ensureTmpBaseDir();
   const tmpOut = path.join(TMP_BASE_DIR, `rebuild-${Date.now()}-${Math.random().toString(36).slice(2, 6)}.tmp`);
   const output = fs.createWriteStream(tmpOut);
@@ -583,7 +651,7 @@ async function rebuildMasterXlsx(): Promise<void> {
   saveMetaLocally(meta);
 
   // Upload to Firebase Storage and persistent fallback
-  await uploadMasterWorkbookToStorage(buffer, meta);
+  await uploadMasterWorkbookToStorage(buffer, meta, idToken);
 }
 
 /**
@@ -1150,12 +1218,17 @@ export async function recordStudentAttendanceInMaster(
 
 /**
  * Public: Finalize Daily Attendance (Administrator Action)
- * Marks all unmarked students for dateStr as 'A' (Absent).
- * Preserves all 'P' and existing historical records.
+ * Retrieves authoritative attendance records for dateStr.
+ * Writes 'P' for students with confirmed attendance.
+ * Writes 'A' for students without confirmed attendance.
+ * Preserves all formulas, formatting, student details, and historical records.
+ * Saves to canonical persistent storage and verifies workbook contents.
  */
 export async function finalizeDailyAttendanceInMaster(
   dateStr: string,
-  adminEmail: string
+  adminEmail: string,
+  attendanceRecords?: AttendanceRecord[],
+  idToken?: string | null
 ): Promise<{
   success: boolean;
   date: string;
@@ -1185,6 +1258,34 @@ export async function finalizeDailyAttendanceInMaster(
     let absentCount = 0;
     const allDateCols = Object.keys(dateInfo.colDateMap);
 
+    // Build lookup maps for confirmed present students
+    const records = Array.isArray(attendanceRecords) ? attendanceRecords : [];
+    const presentStudentUids = new Set<string>();
+    const presentStudentIds = new Set<string>();
+    const presentNamesNormalized = new Set<string>();
+
+    const normalize = (str: string) =>
+      str.toLowerCase().replace(/[\.\,\_\-]/g, ' ').replace(/\s+/g, ' ').trim();
+
+    for (const rec of records) {
+      if (rec.status === 'PRESENT') {
+        if (rec.studentUid) presentStudentUids.add(rec.studentUid);
+        if (rec.studentId) {
+          const rawId = rec.studentId.trim().toUpperCase();
+          presentStudentIds.add(rawId);
+          const numMatch = rawId.match(/(\d+)$/);
+          if (numMatch) {
+            presentStudentIds.add(String(parseInt(numMatch[1], 10)));
+          }
+        }
+        if (rec.studentName) {
+          presentNamesNormalized.add(normalize(rec.studentName));
+        }
+      }
+    }
+
+    const verificationEntries: Record<number, 'P' | 'A' | 'L'> = {};
+
     for (const s of students) {
       const cellRef = `${colName}${s.row}`;
       const rowRegex = new RegExp(`(<row\\b[^>]*r="${s.row}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
@@ -1195,40 +1296,93 @@ export async function finalizeDailyAttendanceInMaster(
       const cellRegex = new RegExp(`<c\\b[^>]*r="${cellRef}"(?:\\/>|[^>]*>(?:[\\s\\S]*?<v>([^<]*)<\\/v>)?(?:[\\s\\S]*?<\\/c>))`);
       const m = rowContent.match(cellRegex);
 
-      let status: 'P' | 'A' | 'L' | null = null;
+      let currentStatus: 'P' | 'A' | 'L' | null = null;
       if (m && m[1] !== undefined && m[1] !== '') {
         const val = m[1];
         const isString = /t="s"/.test(m[0]);
         const text = isString ? sharedStrings[Number(val)] : val;
-        if (text === 'P' || text === 'p') status = 'P';
-        else if (text === 'A' || text === 'a') status = 'A';
-        else if (text === 'L' || text === 'l') status = 'L';
+        if (text === 'P' || text === 'p') currentStatus = 'P';
+        else if (text === 'A' || text === 'a') currentStatus = 'A';
+        else if (text === 'L' || text === 'l') currentStatus = 'L';
       }
 
-      if (status === 'P') {
+      // Check whether this student has confirmed attendance in authoritative records
+      const sSno = s.sno ? String(parseInt(s.sno, 10)) : '';
+      const sAdm = s.admissionNo ? s.admissionNo.trim().toUpperCase() : '';
+      const sNameNorm = normalize(s.name);
+
+      const isConfirmedInRecords =
+        (sSno && presentStudentIds.has(sSno)) ||
+        (sAdm && presentStudentIds.has(sAdm)) ||
+        presentNamesNormalized.has(sNameNorm);
+
+      let finalStatus: 'P' | 'A' | 'L';
+      if (isConfirmedInRecords || currentStatus === 'P') {
+        finalStatus = 'P';
         presentCount++;
-      } else if (status === 'A') {
-        absentCount++;
+      } else if (currentStatus === 'L') {
+        finalStatus = 'L';
       } else {
-        // Unmarked! Mark as 'A' (Absent)
-        finalizedCount++;
+        finalStatus = 'A';
         absentCount++;
-        const targetCellRegex = new RegExp(`<c\\b[^>]*r="${cellRef}"(?:\\/>|[^>]*>[\\s\\S]*?<\\/c>)`);
-        const absentCellXml = `<c r="${cellRef}" s="20" t="s"><v>${SHARED_STRING_ABSENT}</v></c>`;
-
-        if (targetCellRegex.test(rowContent)) {
-          rowContent = rowContent.replace(targetCellRegex, absentCellXml);
-        } else {
-          rowContent += absentCellXml;
-        }
-
-        rowContent = recalculateStudentRow(rowContent, s.row, allDateCols, sharedStrings);
-        sheetXml = sheetXml.replace(rowRegex, `${rowMatch[1]}${rowContent}${rowMatch[3]}`);
+        finalizedCount++;
       }
+
+      verificationEntries[s.row] = finalStatus;
+
+      const stringId =
+        finalStatus === 'P'
+          ? SHARED_STRING_PRESENT
+          : finalStatus === 'A'
+          ? SHARED_STRING_ABSENT
+          : SHARED_STRING_LEAVE;
+
+      const targetCellRegex = new RegExp(`<c\\b[^>]*r="${cellRef}"(?:\\/>|[^>]*>[\\s\\S]*?<\\/c>)`);
+      const updatedCellXml = `<c r="${cellRef}" s="20" t="s"><v>${stringId}</v></c>`;
+
+      if (targetCellRegex.test(rowContent)) {
+        rowContent = rowContent.replace(targetCellRegex, updatedCellXml);
+      } else {
+        // Find sorted column insertion point
+        const targetColIdx = colNameToIndex(colName);
+        const allCells = [...rowContent.matchAll(/<c\b[^>]*r="([A-Z]+)\d+"[^>]*>(?:[\s\S]*?<\/c>)?/g)];
+        let inserted = false;
+        for (const c of allCells) {
+          const cCol = c[1];
+          if (colNameToIndex(cCol) > targetColIdx) {
+            const insertIdx = c.index!;
+            rowContent = rowContent.slice(0, insertIdx) + updatedCellXml + rowContent.slice(insertIdx);
+            inserted = true;
+            break;
+          }
+        }
+        if (!inserted) {
+          rowContent += updatedCellXml;
+        }
+      }
+
+      rowContent = recalculateStudentRow(rowContent, s.row, allDateCols, sharedStrings);
+      sheetXml = sheetXml.replace(rowRegex, `${rowMatch[1]}${rowContent}${rowMatch[3]}`);
     }
 
     fs.writeFileSync(sheet1Path, sheetXml, 'utf8');
-    await rebuildMasterXlsx();
+    await rebuildMasterXlsx(idToken);
+
+    // Verification Step: Confirm that saved workbook contains the expected P/A entries
+    const verifyXml = fs.readFileSync(sheet1Path, 'utf8');
+    for (const [rNum, expected] of Object.entries(verificationEntries)) {
+      const cRef = `${colName}${rNum}`;
+      const cRegex = new RegExp(`<c\\b[^>]*r="${cRef}"[^>]*>[\\s\\S]*?<v>(\\d+)<\\/v>[\\s\\S]*?<\\/c>`);
+      const vMatch = verifyXml.match(cRegex);
+      if (!vMatch) {
+        throw new Error(`Verification error: Cell ${cRef} missing in finalized worksheet.`);
+      }
+      const actualText = sharedStrings[Number(vMatch[1])];
+      if (actualText !== expected) {
+        throw new Error(`Verification error: Cell ${cRef} contains '${actualText}', expected '${expected}'.`);
+      }
+    }
+
     const meta = await syncLatestMeta();
 
     return {

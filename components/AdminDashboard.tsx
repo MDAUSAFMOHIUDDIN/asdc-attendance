@@ -50,13 +50,15 @@ import {
   correctMasterAttendanceEntry,
   triggerMasterWorkbookDownload,
 } from '@/lib/attendance-service';
-import { db } from '@/lib/firebase';
+import { auth, db } from '@/lib/firebase';
 import {
   collection,
   query,
   orderBy,
+  where,
   onSnapshot,
   doc,
+  setDoc,
   updateDoc,
 } from 'firebase/firestore';
 import {
@@ -225,10 +227,45 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
     try {
       setIsTogglingQRAccess(true);
       setQrErrorMessage(null);
+
+      const isEnabled = newStatus === 'ENABLED';
+
+      // 1. Direct authenticated write to Firestore settings/qr_access
+      try {
+        await setDoc(
+          doc(db, 'settings', 'qr_access'),
+          {
+            qrAccessEnabled: isEnabled,
+            status: newStatus,
+            updatedAt: new Date().toISOString(),
+            updatedBy: adminEmail,
+          },
+          { merge: true }
+        );
+      } catch (fsErr) {
+        console.warn('Direct Firestore QR setting update notice:', fsErr);
+      }
+
+      // 2. Obtain ID Token from authenticated admin
+      let idToken: string | null = null;
+      try {
+        if (auth.currentUser) {
+          idToken = await auth.currentUser.getIdToken();
+        }
+      } catch {}
+
+      // 3. Notify backend API route
       const res = await fetch('/api/attendance/qr/toggle', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ adminEmail, status: newStatus }),
+        headers: {
+          'Content-Type': 'application/json',
+          ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+        },
+        body: JSON.stringify({
+          adminEmail,
+          status: newStatus,
+          qrAccessEnabled: isEnabled,
+        }),
       });
       const data = await res.json();
       if (!res.ok) {
@@ -442,40 +479,116 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
     }
   }, []);
 
+  // Real-time Database Listener: Registered Students
   useEffect(() => {
     let isMounted = true;
+    let unsubscribeStudents: (() => void) | undefined;
+
+    // Initial load for holidays, announcements, audit logs, and students
     Promise.all([
       getAllStudents(),
       getHolidays(),
       getAnnouncements(),
       getAuditLogs(),
-    ]).then(([stuList, holMap, annList, logList]) => {
-      if (isMounted) {
-        setStudents(stuList);
-        setHolidays(holMap);
-        setAnnouncements(annList);
-        setAuditLogs(logList);
-        setLoading(false);
-      }
-    }).catch(console.error);
+    ])
+      .then(([stuList, holMap, annList, logList]) => {
+        if (isMounted) {
+          if (stuList.length > 0) setStudents(stuList);
+          setHolidays(holMap);
+          setAnnouncements(annList);
+          setAuditLogs(logList);
+          setLoading(false);
+        }
+      })
+      .catch(console.error);
+
+    // Real-time listener on students collection
+    try {
+      unsubscribeStudents = onSnapshot(
+        collection(db, 'students'),
+        (snapshot) => {
+          if (!isMounted) return;
+          const list: StudentProfile[] = [];
+          snapshot.forEach((d) => {
+            list.push(d.data() as StudentProfile);
+          });
+          list.sort((a, b) => a.studentId.localeCompare(b.studentId));
+          if (list.length > 0) {
+            setStudents(list);
+          }
+        },
+        (err) => console.warn('Real-time students listener notice:', err)
+      );
+    } catch (err) {
+      console.warn('Could not init students listener:', err);
+    }
 
     return () => {
       isMounted = false;
+      if (unsubscribeStudents) unsubscribeStudents();
     };
   }, []);
 
+  // Real-time Database Listener: Attendance records for selectedDate
   useEffect(() => {
     let isMounted = true;
-    if (selectedDate) {
-      getAttendanceRecordsForDate(selectedDate).then((map) => {
-        if (isMounted) {
+    if (!selectedDate) return;
+    setLoadingAttendance(true);
+
+    let unsubscribeAttendance: (() => void) | undefined;
+    try {
+      const q = query(
+        collection(db, 'attendance'),
+        where('classDate', '==', selectedDate)
+      );
+
+      unsubscribeAttendance = onSnapshot(
+        q,
+        (snapshot) => {
+          if (!isMounted) return;
+          const map: Record<string, AttendanceRecord> = {};
+          snapshot.forEach((docSnap) => {
+            const data = docSnap.data() as AttendanceRecord;
+            if (data) {
+              if (data.studentUid) map[data.studentUid] = data;
+              if (data.studentId) {
+                map[data.studentId] = data;
+                map[data.studentId.toUpperCase()] = data;
+              }
+            }
+          });
           setDailyAttendance(map);
           setLoadingAttendance(false);
+        },
+        (error) => {
+          console.warn('Real-time attendance listener fallback to one-time query:', error);
+          if (isMounted) {
+            getAttendanceRecordsForDate(selectedDate)
+              .then((recordsMap) => {
+                if (isMounted) {
+                  setDailyAttendance(recordsMap);
+                  setLoadingAttendance(false);
+                }
+              })
+              .catch(console.error);
+          }
         }
-      }).catch(console.error);
+      );
+    } catch (err) {
+      console.warn('Could not initialize real-time attendance listener:', err);
+      getAttendanceRecordsForDate(selectedDate)
+        .then((recordsMap) => {
+          if (isMounted) {
+            setDailyAttendance(recordsMap);
+            setLoadingAttendance(false);
+          }
+        })
+        .catch(console.error);
     }
+
     return () => {
       isMounted = false;
+      if (unsubscribeAttendance) unsubscribeAttendance();
     };
   }, [selectedDate]);
 
@@ -527,7 +640,11 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
     try {
       setFinalizingSubmitting(true);
       setMasterFeedback(null);
-      const res = await finalizeMasterDailyAttendance(adminEmail, selectedDate);
+      const res = await finalizeMasterDailyAttendance(
+        adminEmail,
+        selectedDate,
+        Object.values(dailyAttendance)
+      );
       setFinalizingModalOpen(false);
       setMasterFeedback({
         type: 'success',
@@ -593,7 +710,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
 
   // Check status for a student on selectedDate
   const getStudentStatusForDate = useCallback(
-    (stuUid: string): {
+    (stuUid: string, stuId?: string): {
       status: 'PRESENT' | 'ABSENT' | 'EXCUSED' | 'NOT_RECORDED' | 'HOLIDAY';
       record?: AttendanceRecord;
     } => {
@@ -602,7 +719,10 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
         return { status: 'HOLIDAY' };
       }
 
-      const rec = dailyAttendance[stuUid];
+      const rec =
+        dailyAttendance[stuUid] ||
+        (stuId ? dailyAttendance[stuId] || dailyAttendance[stuId.toUpperCase()] : undefined);
+
       if (rec) {
         return { status: rec.status, record: rec };
       }
@@ -620,7 +740,32 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
 
   // Filter students based on search and status
   const filteredStudents = useMemo(() => {
-    return students.filter((stu) => {
+    // If any student marked attendance whose profile isn't yet in students state, include them
+    const allStudentsMap = new Map<string, StudentProfile>();
+    students.forEach((s) => allStudentsMap.set(s.uid, s));
+
+    Object.values(dailyAttendance).forEach((rec) => {
+      if (rec.studentUid && !allStudentsMap.has(rec.studentUid)) {
+        allStudentsMap.set(rec.studentUid, {
+          uid: rec.studentUid,
+          studentId: rec.studentId || 'ASDC-0000',
+          fullName: rec.studentName || 'Student',
+          phoneNumber: '',
+          fatherName: '',
+          motherName: '',
+          email: rec.studentEmail || '',
+          batchId: rec.batchId || INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
+          batchName: INSTITUTE_CONFIG.DEFAULT_BATCH_NAME,
+          createdAt: rec.submittedAt || new Date().toISOString(),
+          updatedAt: rec.submittedAt || new Date().toISOString(),
+        });
+      }
+    });
+
+    const combinedList = Array.from(allStudentsMap.values());
+    combinedList.sort((a, b) => a.studentId.localeCompare(b.studentId));
+
+    return combinedList.filter((stu) => {
       const q = searchQuery.toLowerCase().trim();
       const matchesSearch =
         !q ||
@@ -632,14 +777,14 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
       if (!matchesSearch) return false;
 
       if (statusFilter === 'ALL') return true;
-      const { status } = getStudentStatusForDate(stu.uid);
+      const { status } = getStudentStatusForDate(stu.uid, stu.studentId);
       if (statusFilter === 'PRESENT') return status === 'PRESENT';
       if (statusFilter === 'ABSENT') return status === 'ABSENT';
       if (statusFilter === 'NOT_RECORDED') return status === 'NOT_RECORDED';
 
       return true;
     });
-  }, [students, searchQuery, statusFilter, getStudentStatusForDate]);
+  }, [students, dailyAttendance, searchQuery, statusFilter, getStudentStatusForDate]);
 
   // Aggregate Metrics for Selected Date
   const metrics = useMemo(() => {
@@ -648,21 +793,42 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
     let notFinalized = 0;
     const isHoliday = Boolean(holidays[selectedDate]);
 
-    students.forEach((stu) => {
-      const { status } = getStudentStatusForDate(stu.uid);
+    // Use all students including synthesized attendees
+    const allStudentsMap = new Map<string, StudentProfile>();
+    students.forEach((s) => allStudentsMap.set(s.uid, s));
+    Object.values(dailyAttendance).forEach((rec) => {
+      if (rec.studentUid && !allStudentsMap.has(rec.studentUid)) {
+        allStudentsMap.set(rec.studentUid, {
+          uid: rec.studentUid,
+          studentId: rec.studentId || 'ASDC-0000',
+          fullName: rec.studentName || 'Student',
+          phoneNumber: '',
+          fatherName: '',
+          motherName: '',
+          email: rec.studentEmail || '',
+          batchId: rec.batchId || INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
+          batchName: INSTITUTE_CONFIG.DEFAULT_BATCH_NAME,
+          createdAt: rec.submittedAt || new Date().toISOString(),
+          updatedAt: rec.submittedAt || new Date().toISOString(),
+        });
+      }
+    });
+
+    allStudentsMap.forEach((stu) => {
+      const { status } = getStudentStatusForDate(stu.uid, stu.studentId);
       if (status === 'PRESENT') present++;
       else if (status === 'ABSENT') absent++;
       else if (status === 'NOT_RECORDED') notFinalized++;
     });
 
     return {
-      totalStudents: students.length,
+      totalStudents: allStudentsMap.size,
       present,
       absent,
       notFinalized,
       isHoliday,
     };
-  }, [students, selectedDate, holidays, getStudentStatusForDate]);
+  }, [students, dailyAttendance, selectedDate, holidays, getStudentStatusForDate]);
 
   // Handle Attendance Correction Submission
   const handleSaveCorrection = async (e: React.FormEvent) => {
@@ -1208,7 +1374,15 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                     </thead>
                     <tbody className="divide-y divide-slate-100">
                       {filteredStudents.map((stu) => {
-                        const { status, record } = getStudentStatusForDate(stu.uid);
+                        const { status, record } = getStudentStatusForDate(stu.uid, stu.studentId);
+                        const displayTime = record?.verifiedAt
+                          ? new Date(record.verifiedAt).toLocaleTimeString('en-IN', {
+                              timeZone: 'Asia/Kolkata',
+                              hour: '2-digit',
+                              minute: '2-digit',
+                              second: '2-digit',
+                            }) + ' IST'
+                          : '';
                         return (
                           <tr key={stu.uid} className="hover:bg-slate-50 transition">
                             <td className="px-4 py-3 font-mono font-bold text-blue-700">
@@ -1218,7 +1392,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                               {stu.fullName}
                             </td>
                             <td className="px-4 py-3 text-slate-600 font-medium">
-                              <div>+91 {stu.phoneNumber}</div>
+                              <div>{stu.phoneNumber ? `+91 ${stu.phoneNumber}` : '-'}</div>
                               <div className="text-[11px] text-slate-500 font-mono">{stu.email}</div>
                             </td>
                             <td className="px-4 py-3">
@@ -1247,15 +1421,24 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                                 {status === 'NOT_RECORDED' ? 'Open / Pending' : status}
                               </span>
                             </td>
-                            <td className="px-4 py-3 text-slate-600 font-medium">
-                              {record?.source === 'QR_SCAN' ? (
-                                <span className="text-emerald-700 font-semibold">QR Scan ({formatDisplayTimestamp(record.verifiedAt).split('at')[1] || ''})</span>
-                              ) : record?.correctionReason ? (
-                                <span className="text-amber-800 truncate max-w-[140px] block" title={record.correctionReason}>
-                                  Manual: {record.correctionReason}
-                                </span>
+                            <td className="px-4 py-3 text-slate-700 font-medium">
+                              {record ? (
+                                <div>
+                                  <div className="font-semibold text-emerald-700 flex items-center gap-1">
+                                    <CheckCircle className="w-3.5 h-3.5 text-emerald-600" />
+                                    <span>{record.source === 'QR_SCAN' ? 'QR Scan (Verified)' : 'Manual Entry'}</span>
+                                  </div>
+                                  <div className="text-[11px] text-slate-500 font-mono">
+                                    Time: {displayTime || '-'}
+                                  </div>
+                                  {record.correctionReason && (
+                                    <div className="text-[10px] text-amber-700 truncate max-w-[160px]" title={record.correctionReason}>
+                                      Note: {record.correctionReason}
+                                    </div>
+                                  )}
+                                </div>
                               ) : (
-                                '-'
+                                <span className="text-slate-400">-</span>
                               )}
                             </td>
                             <td className="px-4 py-3 text-right">

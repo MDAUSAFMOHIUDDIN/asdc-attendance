@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import QRCode from 'qrcode';
-import { INSTITUTE_CONFIG, SOLE_ADMIN_EMAIL, isAuthorizedAdmin } from './admin-config.ts';
+import { INSTITUTE_CONFIG, SOLE_ADMIN_EMAIL, isAuthorizedAdmin, QR_ACCESS_DISABLED_MESSAGE } from './admin-config.ts';
 import type { ActiveQRChallenge, ClassroomQRPayload, QRAccessStatus } from './types.ts';
 import { OFFICIAL_PERMANENT_QR_PAYLOAD, generateClassroomQRDataUrl } from './qr-generator.ts';
 import { db } from './firebase.ts';
@@ -33,15 +33,26 @@ function ensureDataDir(): void {
 
 // In-memory cache for ultra-fast checks and serverless warm starts
 let inMemoryQRAccessStatus: QRAccessStatus = 'ENABLED';
+let inMemoryQRAccessEnabled = true;
 let lastStatusFetchedAt = 0;
+
+export { QR_ACCESS_DISABLED_MESSAGE };
+
+/**
+ * Authoritative Backend Query: Get current QR Access boolean state (qrAccessEnabled)
+ */
+export async function isQRAccessEnabled(forceFresh = false): Promise<boolean> {
+  const status = await getQRAccessStatus(forceFresh);
+  return status === 'ENABLED';
+}
 
 /**
  * Authoritative Backend Query: Get current QR Access status (ENABLED | DISABLED)
  */
-export async function getQRAccessStatus(): Promise<QRAccessStatus> {
+export async function getQRAccessStatus(forceFresh = false): Promise<QRAccessStatus> {
   const now = Date.now();
-  // Cache for 2 seconds to avoid excessive Firestore reads on rapid scans
-  if (now - lastStatusFetchedAt < 2000) {
+  // If not forcing fresh, cache for 1.5 seconds to avoid excessive disk/network on rapid scans
+  if (!forceFresh && now - lastStatusFetchedAt < 1500) {
     return inMemoryQRAccessStatus;
   }
 
@@ -51,14 +62,23 @@ export async function getQRAccessStatus(): Promise<QRAccessStatus> {
     const snap = await getDoc(settingRef);
     if (snap.exists()) {
       const data = snap.data();
-      if (data && (data.status === 'ENABLED' || data.status === 'DISABLED')) {
-        inMemoryQRAccessStatus = data.status;
-        lastStatusFetchedAt = now;
-        return inMemoryQRAccessStatus;
+      if (data) {
+        if (typeof data.qrAccessEnabled === 'boolean') {
+          inMemoryQRAccessEnabled = data.qrAccessEnabled;
+          inMemoryQRAccessStatus = data.qrAccessEnabled ? 'ENABLED' : 'DISABLED';
+          lastStatusFetchedAt = now;
+          return inMemoryQRAccessStatus;
+        }
+        if (data.status === 'ENABLED' || data.status === 'DISABLED') {
+          inMemoryQRAccessStatus = data.status;
+          inMemoryQRAccessEnabled = data.status === 'ENABLED';
+          lastStatusFetchedAt = now;
+          return inMemoryQRAccessStatus;
+        }
       }
     }
   } catch (err) {
-    // Firestore read error or rules: fall back to local disk
+    // Firestore read error or unauthenticated: fall back to local disk
   }
 
   // 2. Fall back to local file
@@ -67,8 +87,15 @@ export async function getQRAccessStatus(): Promise<QRAccessStatus> {
     try {
       const raw = fs.readFileSync(QR_ACCESS_FILE, 'utf-8');
       const parsed = JSON.parse(raw);
+      if (typeof parsed?.qrAccessEnabled === 'boolean') {
+        inMemoryQRAccessEnabled = parsed.qrAccessEnabled;
+        inMemoryQRAccessStatus = parsed.qrAccessEnabled ? 'ENABLED' : 'DISABLED';
+        lastStatusFetchedAt = now;
+        return inMemoryQRAccessStatus;
+      }
       if (parsed?.status === 'ENABLED' || parsed?.status === 'DISABLED') {
         inMemoryQRAccessStatus = parsed.status;
+        inMemoryQRAccessEnabled = parsed.status === 'ENABLED';
         lastStatusFetchedAt = now;
         return inMemoryQRAccessStatus;
       }
@@ -82,10 +109,12 @@ export async function getQRAccessStatus(): Promise<QRAccessStatus> {
     try {
       const raw = fs.readFileSync(ACTIVE_QR_FILE, 'utf-8');
       const parsed = JSON.parse(raw);
-      if (parsed?.activeChallenge?.status === 'INACTIVE' || parsed?.status === 'DISABLED') {
+      if (parsed?.activeChallenge?.status === 'INACTIVE' || parsed?.status === 'DISABLED' || parsed?.qrAccessEnabled === false) {
         inMemoryQRAccessStatus = 'DISABLED';
+        inMemoryQRAccessEnabled = false;
       } else {
         inMemoryQRAccessStatus = 'ENABLED';
+        inMemoryQRAccessEnabled = true;
       }
       lastStatusFetchedAt = now;
       return inMemoryQRAccessStatus;
@@ -96,6 +125,7 @@ export async function getQRAccessStatus(): Promise<QRAccessStatus> {
 
   // Default initial status is ENABLED
   inMemoryQRAccessStatus = 'ENABLED';
+  inMemoryQRAccessEnabled = true;
   lastStatusFetchedAt = now;
   return 'ENABLED';
 }
@@ -106,17 +136,22 @@ export async function getQRAccessStatus(): Promise<QRAccessStatus> {
  */
 export async function setQRAccessStatus(
   adminEmail: string,
-  newStatus: QRAccessStatus
-): Promise<{ success: boolean; status: QRAccessStatus; updatedAt: string }> {
+  newStatusOrEnabled: QRAccessStatus | boolean
+): Promise<{ success: boolean; status: QRAccessStatus; qrAccessEnabled: boolean; updatedAt: string }> {
   if (!isAuthorizedAdmin(adminEmail)) {
     throw new Error('Unauthorized: Only authorized administrator (mdausafmohiuddin@gmail.com) can change QR access.');
   }
 
+  const isEnabled = typeof newStatusOrEnabled === 'boolean' ? newStatusOrEnabled : newStatusOrEnabled === 'ENABLED';
+  const newStatus: QRAccessStatus = isEnabled ? 'ENABLED' : 'DISABLED';
   const nowIso = new Date().toISOString();
+
   inMemoryQRAccessStatus = newStatus;
+  inMemoryQRAccessEnabled = isEnabled;
   lastStatusFetchedAt = Date.now();
 
   const accessRecord = {
+    qrAccessEnabled: isEnabled,
     status: newStatus,
     updatedAt: nowIso,
     updatedBy: adminEmail,
@@ -127,7 +162,7 @@ export async function setQRAccessStatus(
     const settingRef = doc(db, 'settings', 'qr_access');
     await setDoc(settingRef, accessRecord, { merge: true });
   } catch (err) {
-    console.warn('[QR Service] Firestore status write warning (falling back to disk):', err);
+    console.warn('[QR Service] Firestore status write notice:', err);
   }
 
   // 2. Persist to local disk
@@ -138,7 +173,7 @@ export async function setQRAccessStatus(
     const activeLegacy = {
       activeChallenge: {
         challengeId: 'ASDC_OFFICIAL_PERMANENT_QR',
-        status: newStatus === 'ENABLED' ? 'ACTIVE' : 'INACTIVE',
+        status: isEnabled ? 'ACTIVE' : 'INACTIVE',
         batchId: INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
         issuer: 'ASDC',
         classroomId: INSTITUTE_CONFIG.CLASSROOM_SECRET_KEY,
@@ -146,19 +181,21 @@ export async function setQRAccessStatus(
         generatedBy: SOLE_ADMIN_EMAIL,
         qrPayload: OFFICIAL_PERMANENT_QR_PAYLOAD,
       },
+      qrAccessEnabled: isEnabled,
       status: newStatus,
       updatedAt: nowIso,
     };
     fs.writeFileSync(ACTIVE_QR_FILE, JSON.stringify(activeLegacy, null, 2), 'utf-8');
   } catch (err) {
-    // In read-only serverless, file write might fail, which is okay since Firestore is updated
+    // In read-only serverless, file write might fail
   }
 
-  console.log(`[QR Service] Classroom QR Access updated to ${newStatus} by ${adminEmail}`);
+  console.log(`[QR Service] Classroom QR Access updated to ${newStatus} (qrAccessEnabled: ${isEnabled}) by ${adminEmail}`);
 
   return {
     success: true,
     status: newStatus,
+    qrAccessEnabled: isEnabled,
     updatedAt: nowIso,
   };
 }
@@ -177,7 +214,7 @@ export async function validateClassroomQR(qrPayload: any): Promise<{
     return {
       isValid: false,
       isQrDisabled: true,
-      reason: 'Attendance is currently disabled by the administrator. Please wait until the administrator enables attendance.',
+      reason: QR_ACCESS_DISABLED_MESSAGE,
     };
   }
 
@@ -232,6 +269,7 @@ export async function getActiveQRChallenge() {
     challenge,
     qrDataUrl,
     qrAccessStatus: status,
+    qrAccessEnabled: status === 'ENABLED',
     isPermanent: true,
     totalRefreshes: 0,
     history: [],
@@ -248,11 +286,11 @@ export function validateQRChallenge(challengeId?: string): {
   isQrDisabled?: boolean;
 } {
   // If memory status says disabled
-  if (inMemoryQRAccessStatus === 'DISABLED') {
+  if (inMemoryQRAccessStatus === 'DISABLED' || !inMemoryQRAccessEnabled) {
     return {
       isValid: false,
       isQrDisabled: true,
-      reason: 'Attendance is currently disabled by the administrator. Please wait until the administrator enables attendance.',
+      reason: QR_ACCESS_DISABLED_MESSAGE,
       activeChallengeId: 'ASDC_OFFICIAL_PERMANENT_QR',
     };
   }

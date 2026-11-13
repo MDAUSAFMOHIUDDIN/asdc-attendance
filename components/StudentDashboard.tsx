@@ -52,9 +52,11 @@ export function StudentDashboard({
         (snap) => {
           if (snap.exists()) {
             const data = snap.data();
-            if (data?.status === 'ENABLED' || data?.status === 'DISABLED') {
-              setQrAccessStatus(data.status);
-            }
+            const isEnabled =
+              typeof data?.qrAccessEnabled === 'boolean'
+                ? data.qrAccessEnabled
+                : data?.status === 'ENABLED';
+            setQrAccessStatus(isEnabled ? 'ENABLED' : 'DISABLED');
           }
         },
         (err) => console.warn('Student QR access listener notice:', err)
@@ -258,16 +260,25 @@ export function StudentDashboard({
             {/* Quick Action: Scan QR Button */}
             <div className="flex-shrink-0">
               <button
-                onClick={() => setScannerOpen(true)}
+                disabled={qrAccessStatus !== 'ENABLED'}
+                onClick={() => {
+                  if (qrAccessStatus === 'ENABLED') {
+                    setScannerOpen(true);
+                  }
+                }}
                 className={`w-full sm:w-auto px-5 py-3 rounded-xl font-bold text-sm flex items-center justify-center gap-2.5 shadow-md transition ${
-                  todayRecord && todayRecord.status === 'PRESENT'
+                  qrAccessStatus !== 'ENABLED'
+                    ? 'bg-slate-200 text-slate-500 cursor-not-allowed border border-slate-300 shadow-none'
+                    : todayRecord && todayRecord.status === 'PRESENT'
                     ? 'bg-emerald-50 text-emerald-800 border-2 border-emerald-300 hover:bg-emerald-100'
                     : 'bg-blue-600 hover:bg-blue-700 active:bg-blue-800 text-white shadow-blue-500/20'
                 }`}
               >
                 <QrCode className="w-5 h-5" />
                 <span>
-                  {todayRecord && todayRecord.status === 'PRESENT'
+                  {qrAccessStatus !== 'ENABLED'
+                    ? 'QR Access Disabled'
+                    : todayRecord && todayRecord.status === 'PRESENT'
                     ? 'Scan Again / Verified'
                     : 'Scan Classroom QR'}
                 </span>
@@ -286,7 +297,7 @@ export function StudentDashboard({
               <span className={`font-medium ${qrAccessStatus === 'ENABLED' ? 'text-slate-700' : 'text-rose-700 font-bold'}`}>
                 {qrAccessStatus === 'ENABLED'
                   ? 'Classroom attendance scanner is active.'
-                  : 'Attendance is currently disabled by the administrator. Please wait until the administrator enables attendance.'}
+                  : 'ADMIN HAS DISABLED ATTENDANCE ACCESS. You cannot scan the classroom QR or mark attendance right now. Please wait until the administrator enables access.'}
               </span>
             </div>
             <span className="text-slate-600 font-mono text-[11px] sm:hidden font-semibold">

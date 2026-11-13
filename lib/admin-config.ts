@@ -23,6 +23,9 @@ export function isAuthorizedAdmin(email: string | null | undefined): boolean {
 /**
  * Institute Attendance Settings
  */
+export const QR_ACCESS_DISABLED_MESSAGE =
+  'ADMIN HAS DISABLED ATTENDANCE ACCESS. You cannot scan the classroom QR or mark attendance right now. Please wait until the administrator enables access.';
+
 export const INSTITUTE_CONFIG = {
   INSTITUTE_NAME: 'ASDC',
   INSTITUTE_FULL_NAME: 'ASDC Attendance',
