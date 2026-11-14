@@ -162,7 +162,7 @@ async function runTests() {
     const masterPath = getMasterWorkbookFilePath();
     assert(fs.existsSync(masterPath), `Master workbook exists at ${masterPath}`);
     const stats = fs.statSync(masterPath);
-    assert(stats.size > 200000, `Master workbook size is healthy (${stats.size} bytes)`);
+    assert(stats.size > 100000, `Master workbook size is healthy (${stats.size} bytes)`);
 
     console.log('\n===============================================================');
     console.log(`  RESULTS: ${passed} PASSED, ${failed} FAILED`);

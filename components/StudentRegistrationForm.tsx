@@ -74,9 +74,11 @@ export function StudentRegistrationForm({ user, onRegistered }: StudentRegistrat
     <div className="w-full max-w-lg mx-auto bg-white border border-slate-200 rounded-2xl shadow-xl p-6 sm:p-8">
       {/* Brand Header */}
       <div className="text-center mb-6">
-        <div className="inline-flex items-center justify-center w-12 h-12 rounded-xl bg-blue-50 border border-blue-200 text-blue-600 mb-3 shadow-sm">
-          <UserCheck className="w-6 h-6" />
-        </div>
+        <img
+          src="/asdc-logo.png"
+          alt="ASDC Logo"
+          className="w-20 h-20 object-contain mx-auto mb-3 drop-shadow-sm"
+        />
         <h2 className="text-xl sm:text-2xl font-bold text-slate-950 tracking-tight">
           Complete Student Registration
         </h2>

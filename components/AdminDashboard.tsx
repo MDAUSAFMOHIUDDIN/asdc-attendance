@@ -87,6 +87,8 @@ import {
   INSTITUTE_CONFIG,
 } from '@/lib/admin-config';
 import { generateClassroomQRDataUrl } from '@/lib/qr-generator';
+import { NotificationPanel } from './NotificationPanel';
+import { NotificationComposerModal } from './NotificationComposerModal';
 
 interface AdminDashboardProps {
   adminEmail: string;
@@ -128,6 +130,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
   const [masterCorrectionReason, setMasterCorrectionReason] = useState('');
   const [masterCorrectionSubmitting, setMasterCorrectionSubmitting] = useState(false);
   const [masterFeedback, setMasterFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [notifComposerOpen, setNotifComposerOpen] = useState(false);
 
   // Selected Date Filter for Attendance
   const todayIST = getISTTimeInfo();
@@ -724,7 +727,8 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
         (stuId ? dailyAttendance[stuId] || dailyAttendance[stuId.toUpperCase()] : undefined);
 
       if (rec) {
-        return { status: rec.status, record: rec };
+        const normStatus = (rec.status === 'P' || rec.status === 'PRESENT') ? 'PRESENT' : (rec.status === 'A' || rec.status === 'ABSENT') ? 'ABSENT' : rec.status;
+        return { status: normStatus, record: rec };
       }
 
       const isToday = selectedDate === todayIST.dateString;
@@ -996,9 +1000,11 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
       <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200 shadow-sm">
         <div className="max-w-7xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-blue-600 flex items-center justify-center font-black tracking-wider text-white shadow-sm shadow-blue-500/20">
-              AS
-            </div>
+            <img
+              src="/asdc-logo.png"
+              alt="ASDC Logo"
+              className="w-10 h-10 object-contain rounded-lg flex-shrink-0"
+            />
             <div>
               <div className="flex items-center gap-2">
                 <span className="font-bold text-slate-950 text-base tracking-tight">
@@ -1012,18 +1018,32 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
             </div>
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 sm:gap-3">
             {/* Live IST indicator */}
-            <div className="hidden md:flex items-center gap-1.5 px-3 py-1 rounded-lg bg-slate-50 border border-slate-200 text-xs font-mono text-slate-700">
+            <div className="hidden lg:flex items-center gap-1.5 px-3 py-1 rounded-lg bg-slate-50 border border-slate-200 text-xs font-mono text-slate-700">
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
               <span className="font-semibold">{liveIstTime || 'Connecting...'}</span>
             </div>
 
-            <div className="text-right hidden sm:block">
-              <span className="text-xs font-bold text-slate-900 block truncate max-w-[200px]">
+            {/* Broadcast Push Button */}
+            <button
+              type="button"
+              onClick={() => setNotifComposerOpen(true)}
+              className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold transition shadow-sm"
+              title="Broadcast Push Notification to Students"
+            >
+              <Bell className="w-3.5 h-3.5" />
+              <span>Broadcast Push</span>
+            </button>
+
+            {/* In-app Notification Panel */}
+            <NotificationPanel userUid="admin" isAdmin={true} />
+
+            <div className="text-right hidden md:block">
+              <span className="text-xs font-bold text-slate-900 block truncate max-w-[160px]">
                 {adminEmail}
               </span>
-              <span className="text-[10px] text-blue-700 font-semibold">Sole Authorized Administrator</span>
+              <span className="text-[10px] text-blue-700 font-semibold">Sole Administrator</span>
             </div>
 
             <button
@@ -3145,6 +3165,24 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
           </div>
         </div>
       )}
+
+      {/* Push Notification Composer Modal */}
+      {notifComposerOpen && (
+        <NotificationComposerModal
+          adminEmail={adminEmail}
+          students={students}
+          onClose={() => setNotifComposerOpen(false)}
+        />
+      )}
+
+      {/* Subtle Developer Credits Footer */}
+      <footer className="mt-auto pt-10 pb-6 border-t border-slate-200 text-center text-xs text-slate-500 bg-white">
+        <p>© {new Date().getFullYear()} {INSTITUTE_CONFIG.INSTITUTE_FULL_NAME}. All rights reserved.</p>
+        <p className="mt-1.5 text-[11px] text-slate-400">
+          Developed by <span className="font-semibold text-slate-600">MD AUSAF MOHIUDDIN</span> | Contact:{' '}
+          <a href="tel:9618890557" className="text-blue-600 hover:underline font-mono">9618890557</a>
+        </p>
+      </footer>
     </div>
   );
 }

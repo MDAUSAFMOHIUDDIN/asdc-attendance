@@ -18,8 +18,9 @@ import { getStudentAttendanceRecords, getAnnouncements, getHolidays, calculateSt
 import { formatDisplayDate, formatDisplayTimestamp, checkAttendanceWindow, getISTTimeInfo } from '@/lib/date-utils';
 import { INSTITUTE_CONFIG } from '@/lib/admin-config';
 import { db } from '@/lib/firebase';
-import { doc, onSnapshot } from 'firebase/firestore';
+import { doc, onSnapshot, collection, query, where } from 'firebase/firestore';
 import { QRScannerModal } from './QRScannerModal';
+import { NotificationPanel } from './NotificationPanel';
 
 interface StudentDashboardProps {
   student: StudentProfile;
@@ -111,6 +112,34 @@ export function StudentDashboard({
     }
   }, [student.uid]);
 
+  // Real-time listener for Student Attendance Records from Authoritative Database
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    try {
+      const q = query(
+        collection(db, 'attendance'),
+        where('studentUid', '==', student.uid)
+      );
+      unsubscribe = onSnapshot(
+        q,
+        (snapshot) => {
+          const recList: AttendanceRecord[] = [];
+          snapshot.forEach((d) => {
+            recList.push(d.data() as AttendanceRecord);
+          });
+          recList.sort((a, b) => b.classDate.localeCompare(a.classDate));
+          setRecords(recList);
+        },
+        (err) => console.warn('Student attendance real-time listener notice:', err)
+      );
+    } catch (err) {
+      console.warn('Could not initialize student attendance listener:', err);
+    }
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, [student.uid]);
+
   // Initial load with cleanup to prevent cascading renders
   useEffect(() => {
     let isMounted = true;
@@ -153,14 +182,14 @@ export function StudentDashboard({
       icon: Sparkles,
     };
   } else if (todayRecord) {
-    if (todayRecord.status === 'PRESENT') {
+    if (todayRecord.status === 'PRESENT' || todayRecord.status === 'P') {
       todayStatusDisplay = {
         label: 'PRESENT',
         sub: `Verified via ${todayRecord.source === 'QR_SCAN' ? 'Classroom QR' : 'Institute Override'} at ${formatDisplayTimestamp(todayRecord.verifiedAt)}`,
         color: 'text-emerald-800 bg-emerald-50 border-emerald-300',
         icon: CheckCircle,
       };
-    } else if (todayRecord.status === 'ABSENT') {
+    } else if (todayRecord.status === 'ABSENT' || todayRecord.status === 'A') {
       todayStatusDisplay = {
         label: 'ABSENT',
         sub: todayRecord.correctionReason ? `Note: ${todayRecord.correctionReason}` : 'Marked absent for this class date.',
@@ -194,9 +223,11 @@ export function StudentDashboard({
       <header className="sticky top-0 z-40 bg-white/95 backdrop-blur-md border-b border-slate-200">
         <div className="max-w-4xl mx-auto px-4 sm:px-6 h-16 flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-xl bg-blue-600 flex items-center justify-center font-black tracking-wider text-white shadow-sm shadow-blue-500/20">
-              AS
-            </div>
+            <img
+              src="/asdc-logo.png"
+              alt="ASDC Logo"
+              className="w-10 h-10 object-contain rounded-lg flex-shrink-0"
+            />
             <div>
               <div className="flex items-center gap-2">
                 <span className="font-bold text-slate-950 text-base tracking-tight">
@@ -216,6 +247,9 @@ export function StudentDashboard({
               <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
               <span className="font-semibold">{liveIstTime || 'Connecting...'}</span>
             </div>
+
+            {/* Notification Bell Panel */}
+            <NotificationPanel userUid={student.uid} />
 
             <button
               onClick={() => setProfileModalOpen(true)}
@@ -597,6 +631,15 @@ export function StudentDashboard({
           </div>
         </div>
       )}
+
+      {/* Subtle Developer Credits Footer */}
+      <footer className="mt-auto pt-8 pb-4 border-t border-slate-200 text-center text-xs text-slate-500">
+        <p>© {new Date().getFullYear()} {INSTITUTE_CONFIG.INSTITUTE_FULL_NAME}. All rights reserved.</p>
+        <p className="mt-1.5 text-[11px] text-slate-400">
+          Developed by <span className="font-semibold text-slate-600">MD AUSAF MOHIUDDIN</span> | Contact:{' '}
+          <a href="tel:9618890557" className="text-blue-600 hover:underline font-mono">9618890557</a>
+        </p>
+      </footer>
     </div>
   );
 }

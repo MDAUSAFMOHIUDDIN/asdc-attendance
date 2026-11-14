@@ -202,9 +202,11 @@ function MainAppContent() {
       <div className="max-w-3xl mx-auto w-full px-4 sm:px-6 py-10 sm:py-16 flex-1 flex flex-col justify-center">
         {/* Brand & Heading */}
         <div className="text-center mb-10">
-          <div className="inline-flex items-center justify-center w-16 h-16 rounded-2xl bg-blue-600 text-white font-black text-2xl tracking-wider shadow-lg shadow-blue-500/20 mb-4">
-            ASDC
-          </div>
+          <img
+            src="/asdc-logo.png"
+            alt="ASDC Logo"
+            className="w-24 h-24 sm:w-28 sm:h-28 object-contain mx-auto mb-4 drop-shadow-sm"
+          />
           <h1 className="text-3xl sm:text-4xl font-extrabold text-slate-950 tracking-tight">
             {INSTITUTE_CONFIG.INSTITUTE_FULL_NAME}
           </h1>
@@ -321,8 +323,12 @@ function MainAppContent() {
       </div>
 
       {/* Footer */}
-      <footer className="py-4 border-t border-slate-200 bg-white text-center text-xs text-slate-500">
+      <footer className="py-6 border-t border-slate-200 bg-white text-center text-xs text-slate-500">
         <p>© {new Date().getFullYear()} {INSTITUTE_CONFIG.INSTITUTE_FULL_NAME}. All rights reserved.</p>
+        <p className="mt-1.5 text-[11px] text-slate-400">
+          Developed by <span className="font-semibold text-slate-600">MD AUSAF MOHIUDDIN</span> | Contact:{' '}
+          <a href="tel:9618890557" className="text-blue-600 hover:underline font-mono">9618890557</a>
+        </p>
       </footer>
     </div>
   );

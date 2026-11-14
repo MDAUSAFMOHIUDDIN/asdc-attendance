@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getISTTimeInfo } from '@/lib/date-utils';
 import { INSTITUTE_CONFIG } from '@/lib/admin-config';
-import { db } from '@/lib/firebase';
+import { db, FIREBASE_CONFIG } from '@/lib/firebase';
 import { doc, getDoc, setDoc } from 'firebase/firestore';
-import { AttendanceRecord, ClassroomQRPayload } from '@/lib/types';
+import { AttendanceRecord, AttendanceStatus, ClassroomQRPayload } from '@/lib/types';
 import { recordStudentAttendanceInMaster } from '@/lib/excel-master-service';
 import { getQRAccessStatus, isQRAccessEnabled, QR_ACCESS_DISABLED_MESSAGE } from '@/lib/qr-challenge-service';
 import { verifyStudentLocation, logLocationIncident } from '@/lib/geofence-service';
@@ -135,22 +135,70 @@ export async function POST(request: NextRequest) {
       console.warn('Holiday check notice:', err);
     }
 
-    // 8. Duplicate prevention in Database
+    // 8. Authoritative Duplicate prevention in Database
     const attendanceDocId = `${studentUid}_${classDate}`;
-    const attendanceRef = doc(db, 'attendance', attendanceDocId);
+    const authHeader = request.headers.get('Authorization') || request.headers.get('authorization');
+    const idToken = authHeader && authHeader.startsWith('Bearer ') ? authHeader.split('Bearer ')[1].trim() : null;
+
+    // Check directly via authenticated REST API if ID token is provided
+    let alreadyRecordedInDb = false;
+    let existingDbRecord: AttendanceRecord | null = null;
+
+    if (idToken) {
+      try {
+        const checkUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/attendance/${attendanceDocId}`;
+        const checkRes = await fetch(checkUrl, {
+          method: 'GET',
+          headers: {
+            'Authorization': `Bearer ${idToken}`,
+          },
+        });
+        if (checkRes.ok) {
+          const checkData = await checkRes.json();
+          alreadyRecordedInDb = true;
+          const fields = checkData.fields || {};
+          existingDbRecord = {
+            id: attendanceDocId,
+            studentUid,
+            studentId,
+            studentName,
+            studentEmail,
+            classDate,
+            batchId: fields.batchId?.stringValue || INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
+            status: (fields.status?.stringValue as AttendanceStatus) || 'PRESENT',
+            source: (fields.source?.stringValue as any) || 'QR_SCAN',
+            verifiedAt: fields.verifiedAt?.stringValue || evaluationTime.toISOString(),
+            submittedAt: fields.submittedAt?.stringValue || evaluationTime.toISOString(),
+          };
+          return NextResponse.json({
+            success: true,
+            alreadyRecorded: true,
+            backendDbConfirmed: true,
+            message: `Attendance already recorded for today (${classDate}) as ${existingDbRecord.status}.`,
+            record: existingDbRecord,
+          });
+        }
+      } catch (dbCheckErr) {
+        console.warn('[Submit] Firestore REST duplicate check notice:', dbCheckErr);
+      }
+    }
+
+    // Secondary client SDK check
     try {
+      const attendanceRef = doc(db, 'attendance', attendanceDocId);
       const existingSnap = await getDoc(attendanceRef);
       if (existingSnap.exists()) {
         const existingRecord = existingSnap.data() as AttendanceRecord;
         return NextResponse.json({
-          success: false,
+          success: true,
           alreadyRecorded: true,
+          backendDbConfirmed: true,
           message: `Attendance already recorded for today (${classDate}) as ${existingRecord.status}.`,
           record: existingRecord,
         });
       }
     } catch (dbReadErr) {
-      console.warn('Firestore duplicate check notice:', dbReadErr);
+      // Handled via REST check
     }
 
     // 9. Synchronize attendance record with Canonical Master Excel Register
@@ -188,6 +236,7 @@ export async function POST(request: NextRequest) {
 
     // 11. Prepare schema-compliant authoritative attendance record
     const nowIso = new Date().toISOString();
+    const eventId = `att_${Date.now()}_${studentId}_${Math.random().toString(36).substring(2, 7)}`;
     const newRecord: AttendanceRecord = {
       id: attendanceDocId,
       studentUid,
@@ -200,46 +249,64 @@ export async function POST(request: NextRequest) {
       source: 'QR_SCAN',
       verifiedAt: nowIso,
       submittedAt: nowIso,
+      timestamp: nowIso,
+      eventId,
+      locationVerification: {
+        verified: true,
+        distanceMeters: Math.round(locResult.distanceMeters),
+        gpsAccuracy: location?.accuracy ?? null,
+        withinGeofence: true,
+      },
+      qrValidation: {
+        verified: true,
+        issuer: qrData.issuer,
+        type: qrData.type,
+      },
+      dbCommitStatus: 'COMMITTED',
+      excelSyncStatus,
     };
 
     // If student passed Firebase Auth ID token, write to Firestore REST API with student's authenticated context
-    const authHeader = request.headers.get('Authorization') || request.headers.get('authorization');
     let backendDbConfirmed = false;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const idToken = authHeader.split('Bearer ')[1].trim();
-      if (idToken) {
-        try {
-          const firestoreUrl = `https://firestore.googleapis.com/v1/projects/asdc-attendance/databases/(default)/documents/attendance?documentId=${attendanceDocId}`;
-          const fields: Record<string, any> = {
-            id: { stringValue: newRecord.id },
-            studentUid: { stringValue: newRecord.studentUid },
-            studentId: { stringValue: newRecord.studentId },
-            studentName: { stringValue: newRecord.studentName },
-            studentEmail: { stringValue: newRecord.studentEmail },
-            classDate: { stringValue: newRecord.classDate },
-            batchId: { stringValue: newRecord.batchId },
-            status: { stringValue: newRecord.status },
-            source: { stringValue: newRecord.source },
-            verifiedAt: { stringValue: newRecord.verifiedAt },
-            submittedAt: { stringValue: newRecord.submittedAt || nowIso },
-          };
-          const restRes = await fetch(firestoreUrl, {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${idToken}`,
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({ fields }),
-          });
-          if (restRes.ok) {
-            backendDbConfirmed = true;
-          } else {
-            const errBody = await restRes.text();
-            console.warn('[Submit] Firestore REST direct write note:', errBody);
-          }
-        } catch (restErr) {
-          console.warn('[Submit] Firestore REST API write notice:', restErr);
+    if (idToken) {
+      try {
+        const firestoreUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/attendance/${attendanceDocId}`;
+        const fields: Record<string, any> = {
+          id: { stringValue: newRecord.id },
+          studentUid: { stringValue: newRecord.studentUid },
+          studentId: { stringValue: newRecord.studentId },
+          studentName: { stringValue: newRecord.studentName },
+          studentEmail: { stringValue: newRecord.studentEmail },
+          classDate: { stringValue: newRecord.classDate },
+          batchId: { stringValue: newRecord.batchId },
+          status: { stringValue: newRecord.status },
+          source: { stringValue: newRecord.source },
+          verifiedAt: { stringValue: newRecord.verifiedAt },
+          submittedAt: { stringValue: newRecord.submittedAt || nowIso },
+          timestamp: { stringValue: nowIso },
+          eventId: { stringValue: eventId },
+          dbCommitStatus: { stringValue: 'COMMITTED' },
+          excelSyncStatus: { stringValue: excelSyncStatus },
+        };
+        const restRes = await fetch(firestoreUrl, {
+          method: 'PATCH',
+          headers: {
+            'Authorization': `Bearer ${idToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ fields }),
+        });
+        if (restRes.ok) {
+          backendDbConfirmed = true;
+          console.log(`[Submit] Authoritative record successfully committed to Firestore for ${studentId} on ${classDate}`);
+        } else {
+          const errBody = await restRes.text();
+          console.warn('[Submit] Firestore REST direct write note:', errBody);
+          newRecord.dbCommitStatus = 'PENDING';
         }
+      } catch (restErr) {
+        console.warn('[Submit] Firestore REST API write notice:', restErr);
+        newRecord.dbCommitStatus = 'PENDING';
       }
     }
 

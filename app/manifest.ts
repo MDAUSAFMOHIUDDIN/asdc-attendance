@@ -1,0 +1,51 @@
+import type { MetadataRoute } from 'next';
+
+export default function manifest(): MetadataRoute.Manifest {
+  return {
+    name: 'ASDC Attendance',
+    short_name: 'ASDC Attendance',
+    description: 'Official Advanced Skills Development Center (ASDC) Attendance & Notification System',
+    start_url: '/',
+    scope: '/',
+    display: 'standalone',
+    orientation: 'portrait-primary',
+    background_color: '#ffffff',
+    theme_color: '#2563eb',
+    categories: ['education', 'productivity'],
+    icons: [
+      {
+        src: '/icons/icon-192.png',
+        sizes: '192x192',
+        type: 'image/png',
+        purpose: 'any',
+      },
+      {
+        src: '/icons/icon-512.png',
+        sizes: '512x512',
+        type: 'image/png',
+        purpose: 'any',
+      },
+      {
+        src: '/icons/icon-maskable-192.png',
+        sizes: '192x192',
+        type: 'image/png',
+        purpose: 'maskable',
+      },
+      {
+        src: '/icons/icon-maskable-512.png',
+        sizes: '512x512',
+        type: 'image/png',
+        purpose: 'maskable',
+      },
+    ],
+    shortcuts: [
+      {
+        name: 'Mark Attendance',
+        short_name: 'Attendance',
+        description: 'Scan official classroom QR code',
+        url: '/?action=scan',
+        icons: [{ src: '/icons/icon-192.png', sizes: '192x192' }],
+      },
+    ],
+  };
+}

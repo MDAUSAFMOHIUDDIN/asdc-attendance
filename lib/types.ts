@@ -17,7 +17,20 @@ export interface StudentProfile {
   readAnnouncementIds?: string[];
 }
 
-export type AttendanceStatus = 'PRESENT' | 'ABSENT' | 'EXCUSED';
+export type AttendanceStatus = 'PRESENT' | 'ABSENT' | 'EXCUSED' | 'P' | 'A';
+
+export interface LocationVerificationResult {
+  verified: boolean;
+  distanceMeters?: number | null;
+  gpsAccuracy?: number | null;
+  withinGeofence?: boolean;
+}
+
+export interface QRValidationResult {
+  verified: boolean;
+  issuer?: string;
+  type?: string;
+}
 
 export interface AttendanceRecord {
   id: string; // Typically `${studentUid}_${classDate}`
@@ -31,6 +44,12 @@ export interface AttendanceRecord {
   source: 'QR_SCAN' | 'ADMIN_MANUAL';
   verifiedAt: string;
   submittedAt?: string;
+  timestamp?: string;
+  eventId?: string;
+  locationVerification?: LocationVerificationResult;
+  qrValidation?: QRValidationResult;
+  dbCommitStatus?: 'COMMITTED' | 'PENDING' | 'FAILED';
+  excelSyncStatus?: 'SYNCED' | 'PENDING' | 'FAILED';
   correctionReason?: string;
 }
 
@@ -176,5 +195,29 @@ export interface DateAttendanceRecord {
   name: string;
   status: 'P' | 'A' | 'L' | null;
   cellRef: string;
+}
+
+export interface NotificationItem {
+  id: string;
+  title: string;
+  message: string;
+  recipientUid: string; // 'ALL' or specific student UID
+  recipientName?: string;
+  category: 'GENERAL' | 'URGENT' | 'ATTENDANCE' | 'REMINDER';
+  createdAt: string;
+  createdBy: string;
+  readBy?: string[];
+  url?: string;
+}
+
+export interface PushSubscriptionRecord {
+  uid: string;
+  endpoint: string;
+  keys: {
+    p256dh: string;
+    auth: string;
+  };
+  updatedAt: string;
+  userAgent?: string;
 }
 
