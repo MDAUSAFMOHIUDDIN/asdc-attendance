@@ -2,6 +2,7 @@
 import { VAPID_PUBLIC_KEY } from './push-config';
 import { NotificationItem, PushSubscriptionRecord } from './types';
 import { db, auth } from './firebase';
+import { playNotificationChime } from './notification-audio';
 import {
   collection,
   query,
@@ -163,11 +164,13 @@ export async function unsubscribeFromPush(uid: string): Promise<boolean> {
 export function subscribeToNotifications(
   userUid: string,
   isAdmin: boolean,
-  callback: (notifications: NotificationItem[]) => void
+  callback: (notifications: NotificationItem[]) => void,
+  onNewAlert?: (newItem: NotificationItem) => void
 ): () => void {
   try {
     const notifsRef = collection(db, 'notifications');
     const q = query(notifsRef, orderBy('createdAt', 'desc'), limit(50));
+    let initialLoad = true;
 
     const unsubscribe = onSnapshot(
       q,
@@ -180,6 +183,26 @@ export function subscribeToNotifications(
             items.push({ ...data, id: docSnap.id });
           }
         });
+
+        // Detect newly broadcasted notifications after initial snapshot
+        if (!initialLoad) {
+          snapshot.docChanges().forEach((change) => {
+            if (change.type === 'added') {
+              const fresh = change.doc.data() as NotificationItem;
+              if (isAdmin || fresh.recipientUid === 'ALL' || fresh.recipientUid === userUid) {
+                const isUnread = !fresh.readBy || !fresh.readBy.includes(userUid);
+                if (isUnread) {
+                  playNotificationChime(change.doc.id);
+                  if (onNewAlert) {
+                    onNewAlert({ ...fresh, id: change.doc.id });
+                  }
+                }
+              }
+            }
+          });
+        }
+
+        initialLoad = false;
         callback(items);
       },
       (error) => {
@@ -187,7 +210,26 @@ export function subscribeToNotifications(
       }
     );
 
-    return unsubscribe;
+    // Also listen for foreground messages sent from Service Worker
+    const handleServiceWorkerMessage = (event: MessageEvent) => {
+      if (event.data && event.data.type === 'ASDC_NOTIFICATION_PUSH') {
+        const payload = event.data.notification;
+        if (payload && payload.id) {
+          playNotificationChime(payload.id);
+        }
+      }
+    };
+
+    if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+      navigator.serviceWorker.addEventListener('message', handleServiceWorkerMessage);
+    }
+
+    return () => {
+      unsubscribe();
+      if (typeof navigator !== 'undefined' && 'serviceWorker' in navigator) {
+        navigator.serviceWorker.removeEventListener('message', handleServiceWorkerMessage);
+      }
+    };
   } catch (error) {
     console.error('[Notifications] Failed to attach listener:', error);
     return () => {};
@@ -206,4 +248,22 @@ export async function markNotificationAsRead(
   } catch (error) {
     console.warn('[Notifications] Failed to mark as read:', error);
   }
+}
+
+export async function markAllNotificationsAsRead(
+  notificationIds: string[],
+  userUid: string
+): Promise<void> {
+  if (!userUid || !notificationIds || notificationIds.length === 0) return;
+  const promises = notificationIds.map(async (id) => {
+    try {
+      const docRef = doc(db, 'notifications', id);
+      await updateDoc(docRef, {
+        readBy: arrayUnion(userUid),
+      });
+    } catch (e) {
+      console.warn(`[Notifications] Mark all read note for ${id}:`, e);
+    }
+  });
+  await Promise.allSettled(promises);
 }

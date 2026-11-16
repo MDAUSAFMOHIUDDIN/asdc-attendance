@@ -21,6 +21,7 @@ import { db } from '@/lib/firebase';
 import { doc, onSnapshot, collection, query, where } from 'firebase/firestore';
 import { QRScannerModal } from './QRScannerModal';
 import { NotificationPanel } from './NotificationPanel';
+import { StudentNotificationCenter } from './StudentNotificationCenter';
 
 interface StudentDashboardProps {
   student: StudentProfile;
@@ -414,6 +415,9 @@ export function StudentDashboard({
             </div>
           </div>
         </div>
+
+        {/* Dedicated Student Notifications Centre */}
+        <StudentNotificationCenter studentUid={student.uid} studentName={student.fullName} />
 
         {/* Announcements Section */}
         <div className="bg-white border border-slate-200 rounded-2xl overflow-hidden shadow-sm">

@@ -339,13 +339,15 @@ export async function POST(request: NextRequest) {
 
     // 7. Dispatch Push Notifications via Firebase Cloud Messaging / Web Push
     const pushPayload = JSON.stringify({
+      id: notificationRecord.id,
       title: notificationRecord.title,
       body: notificationRecord.message,
-      icon: '/icons/icon-192.png',
+      icon: '/asdc-logo.png',
       badge: '/icons/icon-192.png',
       url: notificationRecord.url || '/',
       tag: notificationRecord.id,
       category: notificationRecord.category,
+      silent: false,
     });
 
     let deliveredCount = 0;

@@ -105,13 +105,14 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
-// Real Web Push Notifications Handler
+// Real Web Push Notifications Handler with Native OS Sound & Deduplication
 self.addEventListener('push', (event) => {
   let data = {
+    id: `notif_${Date.now()}`,
     title: 'ASDC Attendance Notification',
     body: 'New official update from ASDC administration.',
     url: '/',
-    icon: '/icons/icon-192.png',
+    icon: '/asdc-logo.png',
     badge: '/icons/icon-192.png',
   };
 
@@ -124,13 +125,20 @@ self.addEventListener('push', (event) => {
     }
   }
 
+  const notificationTag = data.tag || data.id || 'asdc_broadcast';
+
   const options = {
     body: data.body,
-    icon: data.icon || '/icons/icon-192.png',
+    icon: data.icon || '/asdc-logo.png',
     badge: data.badge || '/icons/icon-192.png',
-    vibrate: [100, 50, 100],
+    silent: false, // Explicitly false to trigger OS notification sound
+    renotify: true, // Alerts the user even if an older notification with the same tag exists
+    tag: notificationTag, // Prevents duplicate notification stacking
+    vibrate: [200, 100, 200], // Tactile alert on supported mobile devices
     data: {
+      id: data.id,
       url: data.url || '/',
+      tag: notificationTag,
       timestamp: Date.now(),
     },
     actions: [
@@ -139,9 +147,25 @@ self.addEventListener('push', (event) => {
     ],
   };
 
-  event.waitUntil(
-    self.registration.showNotification(data.title, options)
-  );
+  // 1. Notify all active foreground client windows to update UI and play in-app chime
+  const notifyClientsPromise = self.clients
+    .matchAll({ type: 'window', includeUncontrolled: true })
+    .then((windowClients) => {
+      windowClients.forEach((client) => {
+        client.postMessage({
+          type: 'ASDC_NOTIFICATION_PUSH',
+          notification: {
+            ...data,
+            tag: notificationTag,
+          },
+        });
+      });
+    });
+
+  // 2. Display native operating system notification
+  const showNotificationPromise = self.registration.showNotification(data.title, options);
+
+  event.waitUntil(Promise.all([notifyClientsPromise, showNotificationPromise]));
 });
 
 // Notification Click Handler: Focus app or open URL
