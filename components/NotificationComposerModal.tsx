@@ -2,7 +2,9 @@
 
 import React, { useState } from 'react';
 import { Send, X, AlertCircle, CheckCircle2, Users, User, Bell } from 'lucide-react';
-import { StudentProfile } from '@/lib/types';
+import { StudentProfile, NotificationItem } from '@/lib/types';
+import { auth, db } from '@/lib/firebase';
+import { doc, setDoc } from 'firebase/firestore';
 
 interface NotificationComposerModalProps {
   adminEmail: string;
@@ -44,11 +46,47 @@ export function NotificationComposerModal({
 
     setSubmitting(true);
     try {
+      // 1. Authenticate administrator and acquire Firebase ID token
+      const currentUser = auth.currentUser;
+      if (!currentUser) {
+        throw new Error('Administrator session not found. Please log in with Google to broadcast notifications.');
+      }
+
+      const idToken = await currentUser.getIdToken(true);
+      const notificationId = `notif_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+
+      const notificationRecord: NotificationItem = {
+        id: notificationId,
+        title: title.trim(),
+        message: message.trim(),
+        category,
+        recipientUid,
+        recipientName,
+        createdAt: new Date().toISOString(),
+        createdBy: (currentUser.email || adminEmail).toLowerCase().trim(),
+        readBy: [],
+        url: '/',
+      };
+
+      // 2. Client-side database write with authenticated administrator session
+      try {
+        const notifRef = doc(db, 'notifications', notificationId);
+        await setDoc(notifRef, notificationRecord);
+      } catch (clientWriteErr: any) {
+        console.warn('[Notifications] Client write note:', clientWriteErr?.message);
+      }
+
+      // 3. Dispatch to trusted backend with Firebase ID token for verification and push delivery
       const response = await fetch('/api/notifications/send', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${idToken}`,
+        },
         body: JSON.stringify({
-          adminEmail,
+          idToken,
+          existingNotificationId: notificationId,
+          adminEmail: currentUser.email || adminEmail,
           title: title.trim(),
           message: message.trim(),
           category,
@@ -60,12 +98,12 @@ export function NotificationComposerModal({
 
       const data = await response.json();
       if (!response.ok) {
-        throw new Error(data.error || 'Failed to send notification');
+        throw new Error(data.error || 'Failed to dispatch notification.');
       }
 
       setStatusMessage({
         type: 'success',
-        text: data.message || 'Notification broadcasted successfully.',
+        text: data.message || 'Notification broadcasted and delivered successfully.',
       });
 
       setTimeout(() => {
@@ -73,7 +111,11 @@ export function NotificationComposerModal({
         onClose();
       }, 1500);
     } catch (err: any) {
-      setStatusMessage({ type: 'error', text: err.message || 'Failed to dispatch notification.' });
+      console.error('[NotificationComposer] Submit error:', err);
+      setStatusMessage({
+        type: 'error',
+        text: err.message || 'Failed to dispatch notification. Please check administrator permissions.',
+      });
     } finally {
       setSubmitting(false);
     }

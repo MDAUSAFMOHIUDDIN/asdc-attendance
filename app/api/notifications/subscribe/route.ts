@@ -1,12 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { db } from '@/lib/firebase';
-import { doc, setDoc, deleteDoc } from 'firebase/firestore';
+import { FIREBASE_CONFIG } from '@/lib/firebase';
 
 export const dynamic = 'force-dynamic';
 
 export async function POST(request: NextRequest) {
   try {
+    const authHeader = request.headers.get('Authorization') || request.headers.get('authorization');
+    let idToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+
     const body = await request.json();
+    if (!idToken && body.idToken) {
+      idToken = body.idToken;
+    }
+
     const { uid, subscription, userAgent } = body;
 
     if (!uid || !subscription || !subscription.endpoint || !subscription.keys) {
@@ -16,19 +22,47 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const subDoc = {
-      uid,
-      endpoint: subscription.endpoint,
-      keys: {
-        p256dh: subscription.keys.p256dh,
-        auth: subscription.keys.auth,
-      },
-      userAgent: userAgent || 'unknown',
-      updatedAt: new Date().toISOString(),
-    };
+    const p256dh = subscription.keys.p256dh;
+    const authKey = subscription.keys.auth;
+    const nowIso = new Date().toISOString();
 
-    const docRef = doc(db, 'push_subscriptions', uid);
-    await setDoc(docRef, subDoc, { merge: true });
+    // If ID token provided, persist to Firestore REST API with caller's authentication context
+    if (idToken) {
+      try {
+        const projectId = FIREBASE_CONFIG.projectId;
+        const restUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/push_subscriptions/${uid}`;
+        const restRes = await fetch(restUrl, {
+          method: 'PATCH',
+          headers: {
+            Authorization: `Bearer ${idToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            fields: {
+              uid: { stringValue: uid },
+              endpoint: { stringValue: subscription.endpoint },
+              keys: {
+                mapValue: {
+                  fields: {
+                    p256dh: { stringValue: p256dh },
+                    auth: { stringValue: authKey },
+                  },
+                },
+              },
+              userAgent: { stringValue: userAgent || 'unknown' },
+              updatedAt: { stringValue: nowIso },
+            },
+          }),
+        });
+
+        if (!restRes.ok) {
+          const errText = await restRes.text();
+          console.warn('[Subscribe API] Firestore REST write note:', errText);
+        }
+      } catch (restErr) {
+        console.warn('[Subscribe API] Firestore REST write exception:', restErr);
+      }
+    }
 
     return NextResponse.json({
       success: true,
@@ -45,6 +79,9 @@ export async function POST(request: NextRequest) {
 
 export async function DELETE(request: NextRequest) {
   try {
+    const authHeader = request.headers.get('Authorization') || request.headers.get('authorization');
+    const idToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+
     const { searchParams } = new URL(request.url);
     const uid = searchParams.get('uid');
 
@@ -52,8 +89,18 @@ export async function DELETE(request: NextRequest) {
       return NextResponse.json({ error: 'Missing uid parameter.' }, { status: 400 });
     }
 
-    const docRef = doc(db, 'push_subscriptions', uid);
-    await deleteDoc(docRef);
+    if (idToken) {
+      try {
+        const projectId = FIREBASE_CONFIG.projectId;
+        const restUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/push_subscriptions/${uid}`;
+        await fetch(restUrl, {
+          method: 'DELETE',
+          headers: { Authorization: `Bearer ${idToken}` },
+        });
+      } catch (restErr) {
+        console.warn('[Subscribe API] Firestore REST delete note:', restErr);
+      }
+    }
 
     return NextResponse.json({
       success: true,

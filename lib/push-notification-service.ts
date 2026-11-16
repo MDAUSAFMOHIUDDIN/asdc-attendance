@@ -1,7 +1,7 @@
 // Client-side Push Notification Service
 import { VAPID_PUBLIC_KEY } from './push-config';
-import { NotificationItem } from './types';
-import { db } from './firebase';
+import { NotificationItem, PushSubscriptionRecord } from './types';
+import { db, auth } from './firebase';
 import {
   collection,
   query,
@@ -9,6 +9,8 @@ import {
   limit,
   onSnapshot,
   doc,
+  setDoc,
+  deleteDoc,
   updateDoc,
   arrayUnion,
 } from 'firebase/firestore';
@@ -68,19 +70,51 @@ export async function registerPushSubscription(uid: string): Promise<PushSubscri
       });
     }
 
-    // Persist subscription in backend / Firestore
+    const subJson = subscription.toJSON();
+    const endpoint = subJson.endpoint || '';
+    const p256dh = subJson.keys?.p256dh || '';
+    const authKey = subJson.keys?.auth || '';
+
+    if (!endpoint || !p256dh || !authKey) {
+      console.warn('[Push] Subscription keys incomplete, cannot register.');
+      return subscription;
+    }
+
+    const record: PushSubscriptionRecord = {
+      uid,
+      endpoint,
+      keys: { p256dh, auth: authKey },
+      userAgent: navigator.userAgent,
+      updatedAt: new Date().toISOString(),
+    };
+
+    // 1. Direct authenticated client Firestore write (guaranteed by rule request.auth.uid == subId)
+    try {
+      const docRef = doc(db, 'push_subscriptions', uid);
+      await setDoc(docRef, record, { merge: true });
+      console.log('[Push] Subscription saved directly to Firestore');
+    } catch (fsErr) {
+      console.warn('[Push] Direct Firestore write note:', fsErr);
+    }
+
+    // 2. Persist subscription in backend with Firebase Auth ID token
+    const idToken = await auth.currentUser?.getIdToken();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (idToken) headers['Authorization'] = `Bearer ${idToken}`;
+
     const response = await fetch('/api/notifications/subscribe', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({
+        idToken,
         uid,
-        subscription: subscription.toJSON(),
+        subscription: subJson,
         userAgent: navigator.userAgent,
       }),
     });
 
     if (!response.ok) {
-      console.warn('[Push] Backend subscription registration failed:', await response.text());
+      console.warn('[Push] Backend subscription registration note:', await response.text());
     } else {
       console.log('[Push] Successfully subscribed to push notifications');
     }
@@ -102,8 +136,21 @@ export async function unsubscribeFromPush(uid: string): Promise<boolean> {
       await subscription.unsubscribe();
     }
 
+    // 1. Delete directly from Firestore
+    try {
+      await deleteDoc(doc(db, 'push_subscriptions', uid));
+    } catch (e) {
+      console.warn('[Push] Direct delete note:', e);
+    }
+
+    // 2. Delete via backend
+    const idToken = await auth.currentUser?.getIdToken();
+    const headers: Record<string, string> = {};
+    if (idToken) headers['Authorization'] = `Bearer ${idToken}`;
+
     await fetch(`/api/notifications/subscribe?uid=${encodeURIComponent(uid)}`, {
       method: 'DELETE',
+      headers,
     });
 
     return true;

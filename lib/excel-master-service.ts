@@ -496,7 +496,7 @@ export async function uploadMasterWorkbookToStorage(
       { merge: true }
     );
   } catch (fsErr) {
-    console.warn('[Excel Storage] Firestore master workbook write notice:', fsErr);
+    // Notice: Firestore write with client SDK requires authenticated admin session; REST fallback with idToken used when available
   }
 
   // 1b. If idToken is provided, also push via authenticated Firestore REST API
@@ -804,28 +804,24 @@ export function matchStudentToExcelRow(
 ): ExcelStudentRow | null {
   const meta = readMeta();
 
-  // 1. Check explicit mapping
-  if (student.studentId && meta.studentMappings[student.studentId]) {
+  // 1. Prefer unique student IDs from explicit verified metadata mappings
+  if (student.studentId && meta.studentMappings && meta.studentMappings[student.studentId]) {
     const row = meta.studentMappings[student.studentId];
     const found = studentsInWorkbook.find((s) => s.row === row);
     if (found) return found;
   }
 
-  // 2. Check S.NO / admission number match (e.g. ASDC-0001 -> 1)
+  // 2. Check if studentId matches an explicit admissionNo in the workbook (if non-empty and not generic placeholder)
   if (student.studentId) {
-    const cleanId = student.studentId.trim();
-    const numMatch = cleanId.match(/(\d+)$/);
-    if (numMatch) {
-      const numVal = parseInt(numMatch[1], 10);
-      const bySno = studentsInWorkbook.find(
-        (s) => parseInt(s.sno, 10) === numVal || s.admissionNo.toLowerCase() === cleanId.toLowerCase()
-      );
-      if (bySno) return bySno;
-    }
+    const cleanId = student.studentId.trim().toLowerCase();
+    const byAdm = studentsInWorkbook.find(
+      (s) => s.admissionNo && s.admissionNo.toLowerCase() !== 'p' && s.admissionNo.toLowerCase() === cleanId
+    );
+    if (byAdm) return byAdm;
   }
 
-  // 3. Normalized Full Name Match
-  if (!student.fullName) return null;
+  // 3. Where workbook does not contain student IDs, use verified exact student-name matching and flag ambiguous matches
+  if (!student.fullName || !student.fullName.trim()) return null;
 
   const normalize = (str: string) => {
     return str
@@ -835,44 +831,49 @@ export function matchStudentToExcelRow(
       .trim();
   };
 
-  const normInput = normalize(student.fullName);
-
-  // Exact normalized match
-  for (const s of studentsInWorkbook) {
-    if (normalize(s.name) === normInput) return s;
-  }
-
-  // Aliases for common prefix variations
   const expandAliases = (name: string) => {
     return name
-      .replace(/^mohd\b/i, 'mohammed')
-      .replace(/^md\b/i, 'mohammed')
-      .replace(/^shaik\b/i, 'shaikh');
+      .replace(/\bmohd\b/gi, 'mohammed')
+      .replace(/\bmd\b/gi, 'mohammed')
+      .replace(/\bshaik\b/gi, 'shaikh');
   };
 
-  const expandedInput = expandAliases(normInput);
-  for (const s of studentsInWorkbook) {
-    if (expandAliases(normalize(s.name)) === expandedInput) return s;
+  const cleanInput = normalize(student.fullName);
+  const expandedInput = expandAliases(cleanInput);
+
+  // 3a. Exact string match on normalized name
+  const exactMatches = studentsInWorkbook.filter((s) => normalize(s.name) === cleanInput);
+  if (exactMatches.length === 1) return exactMatches[0];
+  if (exactMatches.length > 1) {
+    console.warn(`[Excel Match] Ambiguous exact name match: multiple rows match '${student.fullName}'`);
+    return null;
   }
 
-  // Token-level subset match
-  const inputTokens = new Set(normInput.split(' '));
-  let bestMatch: ExcelStudentRow | null = null;
-  let maxMatches = 0;
-
-  for (const s of studentsInWorkbook) {
-    const sTokens = normalize(s.name).split(' ');
-    let matches = 0;
-    for (const t of sTokens) {
-      if (inputTokens.has(t) && t.length > 2) matches++;
-    }
-    if (matches > maxMatches && matches >= Math.min(2, sTokens.length)) {
-      maxMatches = matches;
-      bestMatch = s;
-    }
+  // 3b. Exact match on alias-expanded name (e.g. Mohd -> Mohammed)
+  const aliasMatches = studentsInWorkbook.filter((s) => expandAliases(normalize(s.name)) === expandedInput);
+  if (aliasMatches.length === 1) return aliasMatches[0];
+  if (aliasMatches.length > 1) {
+    console.warn(`[Excel Match] Ambiguous alias match: multiple rows match '${student.fullName}'`);
+    return null;
   }
 
-  return bestMatch;
+  // 3c. Token set match (all significant words match all words of student row in workbook)
+  const inputWords = expandedInput.split(' ').filter((w) => w.length > 1);
+  const tokenMatches = studentsInWorkbook.filter((s) => {
+    const sWords = expandAliases(normalize(s.name)).split(' ').filter((w) => w.length > 1);
+    if (sWords.length !== inputWords.length) return false;
+    const sWordSet = new Set(sWords);
+    return inputWords.every((w) => sWordSet.has(w));
+  });
+
+  if (tokenMatches.length === 1) return tokenMatches[0];
+  if (tokenMatches.length > 1) {
+    console.warn(`[Excel Match] Ambiguous token match: multiple rows match '${student.fullName}'`);
+    return null;
+  }
+
+  // Never match under another student's name
+  return null;
 }
 
 /**
@@ -934,6 +935,40 @@ function ensureDateColumn(
 }
 
 /**
+ * Safely extract cell text value from XML content of row or sheet
+ */
+function extractCellValue(xml: string, cellRef: string, sharedStrings: string[]): string | null {
+  const regex = new RegExp(`<c\\b[^>]*?\\br="${cellRef}"[^>]*?(?:\\/>|>([\\s\\S]*?)<\\/c>)`);
+  const match = xml.match(regex);
+  if (!match || !match[1]) return null;
+  const vMatch = match[1].match(/<v>([^<]*)<\/v>/);
+  if (!vMatch) return null;
+  const val = vMatch[1];
+  const isString = /t="s"/.test(match[0]);
+  return isString ? (sharedStrings[Number(val)] ?? null) : val;
+}
+
+/**
+ * Safely replace or insert a cell in rowContent preserving XML structure
+ */
+function setCellInRow(rowContent: string, cellRef: string, colName: string, cellXml: string): string {
+  const targetRegex = new RegExp(`<c\\b[^>]*?\\br="${cellRef}"[^>]*?(?:\\/>|>[\\s\\S]*?<\\/c>)`);
+  if (targetRegex.test(rowContent)) {
+    return rowContent.replace(targetRegex, cellXml);
+  }
+  const targetColIdx = colNameToIndex(colName);
+  const allCells = [...rowContent.matchAll(/<c\b[^>]*?\br="([A-Z]+)\d+"[^>]*?(?:\/>|>[\s\S]*?<\/c>)/g)];
+  for (const c of allCells) {
+    const cCol = c[1];
+    if (colNameToIndex(cCol) > targetColIdx) {
+      const insertIdx = c.index!;
+      return rowContent.slice(0, insertIdx) + cellXml + rowContent.slice(insertIdx);
+    }
+  }
+  return rowContent + cellXml;
+}
+
+/**
  * Recalculate summary cells (H=Present, I=Absent, J=Leave, K=%) for a student row
  */
 function recalculateStudentRow(
@@ -947,16 +982,10 @@ function recalculateStudentRow(
   let leaveCount = 0;
 
   for (const col of dateCols) {
-    const cellRegex = new RegExp(`<c\\b[^>]*r="${col}${rowNum}"(?:\\/>|[^>]*>(?:[\\s\\S]*?<v>([^<]*)<\\/v>)?(?:[\\s\\S]*?<\\/c>))`);
-    const m = rowContent.match(cellRegex);
-    if (m && m[1]) {
-      const val = m[1];
-      const isString = /t="s"/.test(m[0]);
-      const text = isString ? sharedStrings[Number(val)] : val;
-      if (text === 'P' || text === 'p') presentCount++;
-      else if (text === 'A' || text === 'a') absentCount++;
-      else if (text === 'L' || text === 'l') leaveCount++;
-    }
+    const text = extractCellValue(rowContent, `${col}${rowNum}`, sharedStrings);
+    if (text === 'P' || text === 'p') presentCount++;
+    else if (text === 'A' || text === 'a') absentCount++;
+    else if (text === 'L' || text === 'l') leaveCount++;
   }
 
   const totalClasses = 90;
@@ -1069,18 +1098,11 @@ export async function getMasterAttendanceForDate(dateStr: string): Promise<{
 
     for (const s of students) {
       const cellRef = `${col}${s.row}`;
-      const cellRegex = new RegExp(`<c\\b[^>]*r="${cellRef}"(?:\\/>|[^>]*>(?:[\\s\\S]*?<v>([^<]*)<\\/v>)?(?:[\\s\\S]*?<\\/c>))`);
-      const match = sheetXml.match(cellRegex);
+      const text = extractCellValue(sheetXml, cellRef, sharedStrings);
       let status: 'P' | 'A' | 'L' | null = null;
-
-      if (match && match[1] !== undefined && match[1] !== '') {
-        const val = match[1];
-        const isString = /t="s"/.test(match[0]);
-        const text = isString ? sharedStrings[Number(val)] : val;
-        if (text === 'P' || text === 'p') status = 'P';
-        else if (text === 'A' || text === 'a') status = 'A';
-        else if (text === 'L' || text === 'l') status = 'L';
-      }
+      if (text === 'P' || text === 'p') status = 'P';
+      else if (text === 'A' || text === 'a') status = 'A';
+      else if (text === 'L' || text === 'l') status = 'L';
 
       if (status === 'P') presentCount++;
       else if (status === 'A') absentCount++;
@@ -1146,21 +1168,15 @@ export async function recordStudentAttendanceInMaster(
     const stringId = status === 'P' ? SHARED_STRING_PRESENT : status === 'A' ? SHARED_STRING_ABSENT : SHARED_STRING_LEAVE;
 
     // 3. Check existing value
-    const cellRegex = new RegExp(`<c\\b[^>]*r="${cellRef}"(?:\\/>|[^>]*>(?:[\\s\\S]*?<v>([^<]*)<\\/v>)?(?:[\\s\\S]*?<\\/c>))`);
-    const existingMatch = sheetXml.match(cellRegex);
-    if (existingMatch && existingMatch[1] !== undefined && existingMatch[1] !== '') {
-      const val = existingMatch[1];
-      const isString = /t="s"/.test(existingMatch[0]);
-      const currentText = isString ? sharedStrings[Number(val)] : val;
-      if (currentText.toUpperCase() === status.toUpperCase()) {
-        return {
-          success: true,
-          row: matched.row,
-          column: colName,
-          alreadyRecorded: true,
-          message: `Attendance already recorded as ${status} in Excel master workbook.`,
-        };
-      }
+    const currentText = extractCellValue(sheetXml, cellRef, sharedStrings);
+    if (currentText && currentText.toUpperCase() === status.toUpperCase()) {
+      return {
+        success: true,
+        row: matched.row,
+        column: colName,
+        alreadyRecorded: true,
+        message: `Attendance already recorded as ${status} in Excel master workbook.`,
+      };
     }
 
     // 4. Update or Insert Cell in Student Row
@@ -1171,29 +1187,8 @@ export async function recordStudentAttendanceInMaster(
     }
 
     let rowContent = rowMatch[2];
-    const targetCellRegex = new RegExp(`<c\\b[^>]*r="${cellRef}"(?:\\/>|[^>]*>[\\s\\S]*?<\\/c>)`);
     const newCellXml = `<c r="${cellRef}" s="20" t="s"><v>${stringId}</v></c>`;
-
-    if (targetCellRegex.test(rowContent)) {
-      rowContent = rowContent.replace(targetCellRegex, newCellXml);
-    } else {
-      // Find sorted alphabetical insertion point
-      const targetColIdx = colNameToIndex(colName);
-      const allCells = [...rowContent.matchAll(/<c\b[^>]*r="([A-Z]+)\d+"[^>]*>(?:[\s\S]*?<\/c>)?/g)];
-      let inserted = false;
-      for (const c of allCells) {
-        const cCol = c[1];
-        if (colNameToIndex(cCol) > targetColIdx) {
-          const insertIdx = c.index!;
-          rowContent = rowContent.slice(0, insertIdx) + newCellXml + rowContent.slice(insertIdx);
-          inserted = true;
-          break;
-        }
-      }
-      if (!inserted) {
-        rowContent += newCellXml;
-      }
-    }
+    rowContent = setCellInRow(rowContent, cellRef, colName, newCellXml);
 
     // 5. Recalculate row summaries
     const allDateCols = Object.keys(dateInfo.colDateMap);
@@ -1258,28 +1253,28 @@ export async function finalizeDailyAttendanceInMaster(
     let absentCount = 0;
     const allDateCols = Object.keys(dateInfo.colDateMap);
 
-    // Build lookup maps for confirmed present students
+    // Build lookup maps for confirmed present students using verified matchStudentToExcelRow
     const records = Array.isArray(attendanceRecords) ? attendanceRecords : [];
-    const presentStudentUids = new Set<string>();
-    const presentStudentIds = new Set<string>();
-    const presentNamesNormalized = new Set<string>();
-
-    const normalize = (str: string) =>
-      str.toLowerCase().replace(/[\.\,\_\-]/g, ' ').replace(/\s+/g, ' ').trim();
+    const presentRowSet = new Set<number>();
+    const absentRowSet = new Set<number>();
+    const leaveRowSet = new Set<number>();
 
     for (const rec of records) {
-      if (rec.status === 'PRESENT') {
-        if (rec.studentUid) presentStudentUids.add(rec.studentUid);
-        if (rec.studentId) {
-          const rawId = rec.studentId.trim().toUpperCase();
-          presentStudentIds.add(rawId);
-          const numMatch = rawId.match(/(\d+)$/);
-          if (numMatch) {
-            presentStudentIds.add(String(parseInt(numMatch[1], 10)));
-          }
-        }
-        if (rec.studentName) {
-          presentNamesNormalized.add(normalize(rec.studentName));
+      const matched = matchStudentToExcelRow(
+        {
+          studentId: rec.studentId,
+          fullName: rec.studentName,
+          email: rec.studentEmail,
+        },
+        students
+      );
+      if (matched) {
+        if (rec.status === 'PRESENT' || (rec.status as any) === 'P') {
+          presentRowSet.add(matched.row);
+        } else if (rec.status === 'ABSENT' || (rec.status as any) === 'A') {
+          absentRowSet.add(matched.row);
+        } else if (rec.status === 'EXCUSED' || (rec.status as any) === 'L') {
+          leaveRowSet.add(matched.row);
         }
       }
     }
@@ -1293,34 +1288,17 @@ export async function finalizeDailyAttendanceInMaster(
       if (!rowMatch) continue;
 
       let rowContent = rowMatch[2];
-      const cellRegex = new RegExp(`<c\\b[^>]*r="${cellRef}"(?:\\/>|[^>]*>(?:[\\s\\S]*?<v>([^<]*)<\\/v>)?(?:[\\s\\S]*?<\\/c>))`);
-      const m = rowContent.match(cellRegex);
-
+      const currentText = extractCellValue(rowContent, cellRef, sharedStrings);
       let currentStatus: 'P' | 'A' | 'L' | null = null;
-      if (m && m[1] !== undefined && m[1] !== '') {
-        const val = m[1];
-        const isString = /t="s"/.test(m[0]);
-        const text = isString ? sharedStrings[Number(val)] : val;
-        if (text === 'P' || text === 'p') currentStatus = 'P';
-        else if (text === 'A' || text === 'a') currentStatus = 'A';
-        else if (text === 'L' || text === 'l') currentStatus = 'L';
-      }
-
-      // Check whether this student has confirmed attendance in authoritative records
-      const sSno = s.sno ? String(parseInt(s.sno, 10)) : '';
-      const sAdm = s.admissionNo ? s.admissionNo.trim().toUpperCase() : '';
-      const sNameNorm = normalize(s.name);
-
-      const isConfirmedInRecords =
-        (sSno && presentStudentIds.has(sSno)) ||
-        (sAdm && presentStudentIds.has(sAdm)) ||
-        presentNamesNormalized.has(sNameNorm);
+      if (currentText === 'P' || currentText === 'p') currentStatus = 'P';
+      else if (currentText === 'A' || currentText === 'a') currentStatus = 'A';
+      else if (currentText === 'L' || currentText === 'l') currentStatus = 'L';
 
       let finalStatus: 'P' | 'A' | 'L';
-      if (isConfirmedInRecords || currentStatus === 'P') {
+      if (presentRowSet.has(s.row) || currentStatus === 'P') {
         finalStatus = 'P';
         presentCount++;
-      } else if (currentStatus === 'L') {
+      } else if (leaveRowSet.has(s.row) || currentStatus === 'L') {
         finalStatus = 'L';
       } else {
         finalStatus = 'A';
@@ -1337,29 +1315,8 @@ export async function finalizeDailyAttendanceInMaster(
           ? SHARED_STRING_ABSENT
           : SHARED_STRING_LEAVE;
 
-      const targetCellRegex = new RegExp(`<c\\b[^>]*r="${cellRef}"(?:\\/>|[^>]*>[\\s\\S]*?<\\/c>)`);
       const updatedCellXml = `<c r="${cellRef}" s="20" t="s"><v>${stringId}</v></c>`;
-
-      if (targetCellRegex.test(rowContent)) {
-        rowContent = rowContent.replace(targetCellRegex, updatedCellXml);
-      } else {
-        // Find sorted column insertion point
-        const targetColIdx = colNameToIndex(colName);
-        const allCells = [...rowContent.matchAll(/<c\b[^>]*r="([A-Z]+)\d+"[^>]*>(?:[\s\S]*?<\/c>)?/g)];
-        let inserted = false;
-        for (const c of allCells) {
-          const cCol = c[1];
-          if (colNameToIndex(cCol) > targetColIdx) {
-            const insertIdx = c.index!;
-            rowContent = rowContent.slice(0, insertIdx) + updatedCellXml + rowContent.slice(insertIdx);
-            inserted = true;
-            break;
-          }
-        }
-        if (!inserted) {
-          rowContent += updatedCellXml;
-        }
-      }
+      rowContent = setCellInRow(rowContent, cellRef, colName, updatedCellXml);
 
       rowContent = recalculateStudentRow(rowContent, s.row, allDateCols, sharedStrings);
       sheetXml = sheetXml.replace(rowRegex, `${rowMatch[1]}${rowContent}${rowMatch[3]}`);
@@ -1393,6 +1350,200 @@ export async function finalizeDailyAttendanceInMaster(
       presentCount,
       absentCount,
       version: meta.version,
+    };
+  });
+}
+
+/**
+ * Public: Reconcile ALL dates and ALL students in Master Excel Workbook.
+ * Reconciles authoritative records across all dates.
+ * Historical attendance is accurately reflected.
+ * P = Present
+ * A = Absent (only for finalized dates or explicitly recorded absences)
+ * Unfinalized or genuinely unknown attendance is NOT marked absent.
+ * Recalculates all formulas, updates persistent storage, verifies cells, and returns sync summary.
+ */
+export async function reconcileAllDatesInMaster(params: {
+  allAttendanceRecords: AttendanceRecord[];
+  finalizedDates?: string[];
+  adminEmail?: string;
+  idToken?: string | null;
+}): Promise<{
+  success: boolean;
+  syncedDates: string[];
+  totalUpdatedCells: number;
+  dateSummary: Record<string, { present: number; absent: number; unfinalized: number }>;
+  version: number;
+  message: string;
+}> {
+  const { allAttendanceRecords, finalizedDates = [], idToken } = params;
+
+  return lock.acquire('master-workbook', async () => {
+    await syncFromStorage();
+    const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
+    let sheetXml = fs.readFileSync(sheet1Path, 'utf8');
+    const sharedStrings = loadSharedStrings();
+
+    let dateInfo = parseDateColumns(sheetXml);
+    const students = parseStudents(sheetXml, sharedStrings);
+    const finalizedSet = new Set<string>(finalizedDates);
+
+    // Group records by classDate -> Map<studentRow, status>
+    const recordsByDate = new Map<string, Map<number, 'P' | 'A' | 'L'>>();
+
+    for (const rec of allAttendanceRecords) {
+      if (!rec.classDate || !rec.classDate.match(/^\d{4}-\d{2}-\d{2}$/)) continue;
+      const matched = matchStudentToExcelRow(
+        {
+          studentId: rec.studentId,
+          fullName: rec.studentName,
+          email: rec.studentEmail,
+        },
+        students
+      );
+      if (!matched) continue;
+
+      if (!recordsByDate.has(rec.classDate)) {
+        recordsByDate.set(rec.classDate, new Map());
+      }
+
+      const st = rec.status;
+      const normalizedStatus: 'P' | 'A' | 'L' =
+        st === 'PRESENT' || (st as any) === 'P'
+          ? 'P'
+          : st === 'ABSENT' || (st as any) === 'A'
+          ? 'A'
+          : 'L';
+
+      recordsByDate.get(rec.classDate)!.set(matched.row, normalizedStatus);
+    }
+
+    // Determine all dates to synchronize
+    const allDates = Array.from(
+      new Set([
+        ...Array.from(recordsByDate.keys()),
+        ...Array.from(finalizedSet.keys()),
+      ])
+    ).sort();
+
+    let totalUpdatedCells = 0;
+    const dateSummary: Record<string, { present: number; absent: number; unfinalized: number }> = {};
+    const verificationMap: Record<string, 'P' | 'A' | 'L'> = {};
+
+    for (const dateStr of allDates) {
+      const { updatedSheetXml, colName } = ensureDateColumn(sheetXml, dateStr, dateInfo);
+      sheetXml = updatedSheetXml;
+      dateInfo = parseDateColumns(sheetXml);
+
+      const isFinalized = finalizedSet.has(dateStr);
+      const studentMap = recordsByDate.get(dateStr) || new Map();
+      let presentCount = 0;
+      let absentCount = 0;
+      let unfinalizedCount = 0;
+
+      for (const s of students) {
+        const cellRef = `${colName}${s.row}`;
+        const rowRegex = new RegExp(`(<row\\b[^>]*r="${s.row}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
+        const rowMatch = sheetXml.match(rowRegex);
+        if (!rowMatch) continue;
+
+        let rowContent = rowMatch[2];
+        const currentText = extractCellValue(rowContent, cellRef, sharedStrings);
+        let currentVal: 'P' | 'A' | 'L' | null = null;
+        if (currentText === 'P' || currentText === 'p') currentVal = 'P';
+        else if (currentText === 'A' || currentText === 'a') currentVal = 'A';
+        else if (currentText === 'L' || currentText === 'l') currentVal = 'L';
+
+        const recStatus = studentMap.get(s.row);
+        let targetStatus: 'P' | 'A' | 'L' | null = null;
+
+        if (recStatus === 'P') {
+          targetStatus = 'P';
+          presentCount++;
+        } else if (recStatus === 'A') {
+          targetStatus = 'A';
+          absentCount++;
+        } else if (recStatus === 'L') {
+          targetStatus = 'L';
+        } else if (currentVal === 'P') {
+          // Preserve existing confirmed present in workbook
+          targetStatus = 'P';
+          presentCount++;
+        } else if (currentVal === 'L') {
+          targetStatus = 'L';
+        } else {
+          // No record in DB and not previously present/leave
+          if (isFinalized) {
+            targetStatus = 'A';
+            absentCount++;
+          } else {
+            // Unfinalized date: keep unrecorded (do NOT mark absent)
+            targetStatus = null;
+            unfinalizedCount++;
+          }
+        }
+
+        if (targetStatus !== null) {
+          verificationMap[cellRef] = targetStatus;
+          const stringId =
+            targetStatus === 'P'
+              ? SHARED_STRING_PRESENT
+              : targetStatus === 'A'
+              ? SHARED_STRING_ABSENT
+              : SHARED_STRING_LEAVE;
+
+          const updatedCellXml = `<c r="${cellRef}" s="20" t="s"><v>${stringId}</v></c>`;
+          rowContent = setCellInRow(rowContent, cellRef, colName, updatedCellXml);
+          totalUpdatedCells++;
+        }
+
+        sheetXml = sheetXml.replace(rowRegex, `${rowMatch[1]}${rowContent}${rowMatch[3]}`);
+      }
+
+      dateSummary[dateStr] = {
+        present: presentCount,
+        absent: absentCount,
+        unfinalized: unfinalizedCount,
+      };
+    }
+
+    // Recalculate summary columns (H=Present, I=Absent, J=Leave, K=%) for all student rows
+    const allDateCols = Object.keys(dateInfo.colDateMap);
+    for (const s of students) {
+      const rowRegex = new RegExp(`(<row\\b[^>]*r="${s.row}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
+      const rowMatch = sheetXml.match(rowRegex);
+      if (rowMatch) {
+        let rowContent = rowMatch[2];
+        rowContent = recalculateStudentRow(rowContent, s.row, allDateCols, sharedStrings);
+        sheetXml = sheetXml.replace(rowRegex, `${rowMatch[1]}${rowContent}${rowMatch[3]}`);
+      }
+    }
+
+    fs.writeFileSync(sheet1Path, sheetXml, 'utf8');
+    await rebuildMasterXlsx(idToken);
+
+    // Verify cell updates
+    const verifyXml = fs.readFileSync(sheet1Path, 'utf8');
+    for (const [cRef, expected] of Object.entries(verificationMap)) {
+      const cRegex = new RegExp(`<c\\b[^>]*r="${cRef}"[^>]*>[\\s\\S]*?<v>(\\d+)<\\/v>[\\s\\S]*?<\\/c>`);
+      const vMatch = verifyXml.match(cRegex);
+      if (vMatch) {
+        const actualText = sharedStrings[Number(vMatch[1])];
+        if (actualText !== expected) {
+          console.warn(`[Sync Reconcile] Cell ${cRef} contains '${actualText}', expected '${expected}'`);
+        }
+      }
+    }
+
+    const meta = await syncLatestMeta();
+
+    return {
+      success: true,
+      syncedDates: allDates,
+      totalUpdatedCells,
+      dateSummary,
+      version: meta.version,
+      message: `Successfully synchronized ${allDates.length} date(s) across all ${students.length} students in canonical Master Excel workbook.`,
     };
   });
 }
@@ -1436,7 +1587,6 @@ export async function correctAttendanceEntryInMaster(params: {
     }
 
     let rowContent = rowMatch[2];
-    const targetCellRegex = new RegExp(`<c\\b[^>]*r="${cellRef}"(?:\\/>|[^>]*>[\\s\\S]*?<\\/c>)`);
 
     let newCellXml = `<c r="${cellRef}" s="20"/>`;
     if (newStatus === 'P') {
@@ -1447,11 +1597,7 @@ export async function correctAttendanceEntryInMaster(params: {
       newCellXml = `<c r="${cellRef}" s="20" t="s"><v>${SHARED_STRING_LEAVE}</v></c>`;
     }
 
-    if (targetCellRegex.test(rowContent)) {
-      rowContent = rowContent.replace(targetCellRegex, newCellXml);
-    } else {
-      rowContent += newCellXml;
-    }
+    rowContent = setCellInRow(rowContent, cellRef, colName, newCellXml);
 
     const allDateCols = Object.keys(dateInfo.colDateMap);
     rowContent = recalculateStudentRow(rowContent, row, allDateCols, sharedStrings);

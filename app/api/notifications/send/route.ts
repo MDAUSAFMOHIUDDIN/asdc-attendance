@@ -1,7 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { SOLE_ADMIN_EMAIL } from '@/lib/admin-config';
-import { db } from '@/lib/firebase';
-import { doc, setDoc, collection, getDocs, getDoc, deleteDoc } from 'firebase/firestore';
+import { FIREBASE_CONFIG } from '@/lib/firebase';
 import * as webPush from 'web-push';
 import { VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT } from '@/lib/push-config';
 import { NotificationItem, PushSubscriptionRecord } from '@/lib/types';
@@ -20,38 +19,262 @@ function ensureVapidConfigured() {
   }
 }
 
+/**
+ * Verify Firebase Auth ID token and ensure caller is the authorized sole administrator
+ */
+async function verifyAdminIdToken(idToken: string): Promise<{ authorized: boolean; email?: string; error?: string }> {
+  try {
+    const apiKey = FIREBASE_CONFIG.apiKey;
+    if (!apiKey) {
+      return { authorized: false, error: 'Firebase API key is not configured.' };
+    }
+
+    const res = await fetch(
+      `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${apiKey}`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ idToken }),
+      }
+    );
+
+    if (!res.ok) {
+      const errText = await res.text();
+      return { authorized: false, error: `Invalid or expired administrator token: ${errText}` };
+    }
+
+    const data = await res.json();
+    const user = data.users?.[0];
+    if (!user || !user.email) {
+      return { authorized: false, error: 'No user account found for provided token.' };
+    }
+
+    const normalizedEmail = user.email.toLowerCase().trim();
+    const authorizedEmail = SOLE_ADMIN_EMAIL.toLowerCase().trim();
+
+    if (normalizedEmail !== authorizedEmail) {
+      return {
+        authorized: false,
+        email: normalizedEmail,
+        error: `Unauthorized: Only ${SOLE_ADMIN_EMAIL} can send broadcast push notifications.`,
+      };
+    }
+
+    return { authorized: true, email: normalizedEmail };
+  } catch (err: any) {
+    return { authorized: false, error: `Token verification failed: ${err.message || String(err)}` };
+  }
+}
+
+/**
+ * Save notification record to Firestore via authenticated REST API
+ */
+async function saveNotificationToFirestore(
+  notification: NotificationItem,
+  idToken: string
+): Promise<{ success: boolean; error?: string }> {
+  try {
+    const projectId = FIREBASE_CONFIG.projectId;
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/notifications/${notification.id}`;
+
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        fields: {
+          id: { stringValue: notification.id },
+          title: { stringValue: notification.title },
+          message: { stringValue: notification.message },
+          category: { stringValue: notification.category },
+          recipientUid: { stringValue: notification.recipientUid },
+          recipientName: { stringValue: notification.recipientName },
+          createdAt: { stringValue: notification.createdAt },
+          createdBy: { stringValue: notification.createdBy },
+          url: { stringValue: notification.url || '/' },
+          readBy: { arrayValue: { values: [] } },
+        },
+      }),
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      return { success: false, error: `Firestore notification write rejected: ${errText}` };
+    }
+
+    return { success: true };
+  } catch (err: any) {
+    return { success: false, error: err.message || 'Network error saving notification to Firestore.' };
+  }
+}
+
+/**
+ * Retrieve push subscriptions from Firestore via authenticated REST API
+ */
+async function fetchPushSubscriptions(
+  idToken: string,
+  recipientUid: string
+): Promise<{ subscriptions: PushSubscriptionRecord[]; error?: string }> {
+  try {
+    const projectId = FIREBASE_CONFIG.projectId;
+
+    if (recipientUid !== 'ALL') {
+      // Targeted single student subscription
+      const singleUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/push_subscriptions/${recipientUid}`;
+      const res = await fetch(singleUrl, {
+        method: 'GET',
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+
+      if (!res.ok) {
+        if (res.status === 404) return { subscriptions: [] };
+        const errText = await res.text();
+        return { subscriptions: [], error: `Failed to fetch student subscription: ${errText}` };
+      }
+
+      const docData = await res.json();
+      const fields = docData.fields || {};
+      const endpoint = fields.endpoint?.stringValue;
+      const p256dh = fields.keys?.mapValue?.fields?.p256dh?.stringValue;
+      const authKey = fields.keys?.mapValue?.fields?.auth?.stringValue;
+
+      if (endpoint && p256dh && authKey) {
+        return {
+          subscriptions: [
+            {
+              uid: recipientUid,
+              endpoint,
+              keys: { p256dh, auth: authKey },
+              userAgent: fields.userAgent?.stringValue,
+              updatedAt: fields.updatedAt?.stringValue,
+            },
+          ],
+        };
+      }
+      return { subscriptions: [] };
+    }
+
+    // Broadcast: Retrieve all subscriptions
+    const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/push_subscriptions`;
+    const res = await fetch(listUrl, {
+      method: 'GET',
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+
+    if (!res.ok) {
+      const errText = await res.text();
+      return { subscriptions: [], error: `Failed to query push subscriptions: ${errText}` };
+    }
+
+    const data = await res.json();
+    const docs = data.documents || [];
+    const subscriptions: PushSubscriptionRecord[] = [];
+
+    for (const d of docs) {
+      const fields = d.fields || {};
+      const uid = fields.uid?.stringValue || d.name?.split('/').pop() || '';
+      const endpoint = fields.endpoint?.stringValue;
+      const p256dh = fields.keys?.mapValue?.fields?.p256dh?.stringValue;
+      const authKey = fields.keys?.mapValue?.fields?.auth?.stringValue;
+
+      if (uid && endpoint && p256dh && authKey) {
+        subscriptions.push({
+          uid,
+          endpoint,
+          keys: { p256dh, auth: authKey },
+          userAgent: fields.userAgent?.stringValue,
+          updatedAt: fields.updatedAt?.stringValue,
+        });
+      }
+    }
+
+    return { subscriptions };
+  } catch (err: any) {
+    return { subscriptions: [], error: err.message || 'Error fetching subscriptions from database.' };
+  }
+}
+
+/**
+ * Clean up invalid or expired subscription from Firestore
+ */
+async function removeExpiredSubscription(uid: string, idToken: string): Promise<void> {
+  try {
+    const projectId = FIREBASE_CONFIG.projectId;
+    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/push_subscriptions/${uid}`;
+    await fetch(url, {
+      method: 'DELETE',
+      headers: { Authorization: `Bearer ${idToken}` },
+    });
+    console.log(`[Notifications] Cleaned up expired push subscription for user ${uid}`);
+  } catch (cleanErr) {
+    console.warn('[Notifications] Expired subscription cleanup note:', cleanErr);
+  }
+}
+
 export async function POST(request: NextRequest) {
   try {
     ensureVapidConfigured();
+
+    // 1. Extract Bearer token from header or body
+    const authHeader = request.headers.get('Authorization') || request.headers.get('authorization');
+    let idToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+
     const body = await request.json();
+    if (!idToken && body.idToken) {
+      idToken = body.idToken;
+    }
+
+    if (!idToken) {
+      return NextResponse.json(
+        {
+          error:
+            'Authentication Required: Administrator session token was not provided. Please ensure you are logged into Firebase as the administrator.',
+        },
+        { status: 401 }
+      );
+    }
+
+    // 2. Authenticate & Authorize Administrator on Trusted Backend
+    const authResult = await verifyAdminIdToken(idToken);
+    if (!authResult.authorized) {
+      return NextResponse.json(
+        { error: authResult.error || `Unauthorized: Only ${SOLE_ADMIN_EMAIL} can broadcast notifications.` },
+        { status: 403 }
+      );
+    }
+
     const {
-      adminEmail,
       title,
       message,
       category = 'GENERAL',
       recipientUid = 'ALL',
       recipientName = 'All Students',
       url = '/',
+      existingNotificationId,
     } = body;
 
-    // 1. Strict Sole Admin Authorization
-    if (!adminEmail || adminEmail.toLowerCase().trim() !== SOLE_ADMIN_EMAIL.toLowerCase().trim()) {
+    // 3. Input validation with meaningful error messages
+    if (!title || typeof title !== 'string' || title.trim().length < 3) {
       return NextResponse.json(
-        { error: 'Unauthorized: Only the sole ASDC administrator can broadcast notifications.' },
-        { status: 403 }
+        { error: 'Invalid title: Notification title must be at least 3 characters long.' },
+        { status: 400 }
+      );
+    }
+    if (!message || typeof message !== 'string' || message.trim().length < 5) {
+      return NextResponse.json(
+        { error: 'Invalid message: Notification message body must be at least 5 characters long.' },
+        { status: 400 }
       );
     }
 
-    // 2. Validate input
-    if (!title || title.trim().length < 3) {
-      return NextResponse.json({ error: 'Title must be at least 3 characters.' }, { status: 400 });
-    }
-    if (!message || message.trim().length < 5) {
-      return NextResponse.json({ error: 'Message must be at least 5 characters.' }, { status: 400 });
-    }
+    // 4. Prepare schema-compliant NotificationItem
+    const notificationId =
+      existingNotificationId && /^[a-zA-Z0-9_\-]+$/.test(existingNotificationId)
+        ? existingNotificationId
+        : `notif_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
 
-    // 3. Persist notification in Firestore
-    const notificationId = `notif_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
     const notificationRecord: NotificationItem = {
       id: notificationId,
       title: title.trim(),
@@ -60,33 +283,28 @@ export async function POST(request: NextRequest) {
       recipientUid,
       recipientName,
       createdAt: new Date().toISOString(),
-      createdBy: adminEmail.toLowerCase().trim(),
+      createdBy: SOLE_ADMIN_EMAIL.toLowerCase().trim(),
       readBy: [],
-      url,
+      url: url || '/',
     };
 
-    const notifRef = doc(db, 'notifications', notificationId);
-    await setDoc(notifRef, notificationRecord);
-
-    // 4. Retrieve target Push Subscriptions
-    const subscriptions: PushSubscriptionRecord[] = [];
-    try {
-      if (recipientUid === 'ALL') {
-        const subSnap = await getDocs(collection(db, 'push_subscriptions'));
-        subSnap.forEach((docSnap) => {
-          subscriptions.push(docSnap.data() as PushSubscriptionRecord);
-        });
-      } else {
-        const singleSubDoc = await getDoc(doc(db, 'push_subscriptions', recipientUid));
-        if (singleSubDoc.exists()) {
-          subscriptions.push(singleSubDoc.data() as PushSubscriptionRecord);
-        }
-      }
-    } catch (fetchSubErr) {
-      console.warn('[Notifications] Could not fetch subscriptions from Firestore:', fetchSubErr);
+    // 5. Persist notification to Firestore via authenticated REST API
+    const saveResult = await saveNotificationToFirestore(notificationRecord, idToken);
+    if (!saveResult.success) {
+      console.error('[Notifications] Database save failed:', saveResult.error);
+      return NextResponse.json(
+        { error: `Database error: Could not save notification to Firestore: ${saveResult.error}` },
+        { status: 500 }
+      );
     }
 
-    // 5. Send Web Push to subscribers
+    // 6. Retrieve registered students' valid push subscriptions
+    const { subscriptions, error: subError } = await fetchPushSubscriptions(idToken, recipientUid);
+    if (subError) {
+      console.warn('[Notifications] Subscription fetch notice:', subError);
+    }
+
+    // 7. Dispatch Push Notifications via Firebase Cloud Messaging / Web Push
     const pushPayload = JSON.stringify({
       title: notificationRecord.title,
       body: notificationRecord.message,
@@ -94,9 +312,12 @@ export async function POST(request: NextRequest) {
       badge: '/icons/icon-192.png',
       url: notificationRecord.url || '/',
       tag: notificationRecord.id,
+      category: notificationRecord.category,
     });
 
     let deliveredCount = 0;
+    let expiredCount = 0;
+
     const deliveryPromises = subscriptions.map(async (sub) => {
       try {
         await webPush.sendNotification(
@@ -111,13 +332,10 @@ export async function POST(request: NextRequest) {
         );
         deliveredCount++;
       } catch (pushErr: any) {
-        // If subscription is expired (410) or not found (404), clean it up
+        // HTTP 410 (Gone) or 404 (Not Found) means expired/unregistered token
         if (pushErr.statusCode === 410 || pushErr.statusCode === 404) {
-          try {
-            await deleteDoc(doc(db, 'push_subscriptions', sub.uid));
-          } catch (cleanErr) {
-            console.warn('[Notifications] Error cleaning up expired sub:', cleanErr);
-          }
+          expiredCount++;
+          await removeExpiredSubscription(sub.uid, idToken!);
         } else {
           console.warn(`[Notifications] Web push failed for user ${sub.uid}:`, pushErr.message);
         }
@@ -128,15 +346,19 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      message: `Notification sent successfully to ${recipientName}. Delivered to ${deliveredCount} active device(s).`,
+      message:
+        recipientUid === 'ALL'
+          ? `Broadcast notification dispatched successfully. Delivered to ${deliveredCount} active student device(s).`
+          : `Notification sent successfully to ${recipientName}. Delivered to ${deliveredCount} device(s).`,
       notification: notificationRecord,
       deliveredCount,
       targetSubscribers: subscriptions.length,
+      expiredCleanedUp: expiredCount,
     });
   } catch (error: any) {
-    console.error('[Notifications] Send notification error:', error);
+    console.error('[Notifications] Dispatch error:', error);
     return NextResponse.json(
-      { error: error.message || 'Failed to send notification.' },
+      { error: error.message || 'An unexpected error occurred while sending notification.' },
       { status: 500 }
     );
   }
