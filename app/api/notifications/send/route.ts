@@ -180,8 +180,8 @@ async function fetchPushSubscriptions(
       return { subscriptions: [] };
     }
 
-    // Broadcast: Retrieve all subscriptions
-    const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/push_subscriptions`;
+    // Broadcast: Retrieve all subscriptions with maximum page size
+    const listUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/push_subscriptions?pageSize=300`;
     const res = await fetch(listUrl, {
       method: 'GET',
       headers: { Authorization: `Bearer ${idToken}` },
@@ -337,18 +337,50 @@ export async function POST(request: NextRequest) {
       console.warn('[Notifications] Subscription fetch notice:', subError);
     }
 
-    // 7. Dispatch Push Notifications via Firebase Cloud Messaging / Web Push
+    // 7. Dispatch High-Priority Push Notifications via Firebase Cloud Messaging / Web Push
+    const origin = process.env.NEXT_PUBLIC_APP_URL || 'https://asdc-attendance-tktz.vercel.app';
+    const absoluteIcon = `${origin}/asdc-logo.png`;
+    const absoluteBadge = `${origin}/icons/icon-192.png`;
+    const targetUrl = notificationRecord.url?.startsWith('http')
+      ? notificationRecord.url
+      : `${origin}${notificationRecord.url || '/'}`;
+
     const pushPayload = JSON.stringify({
       id: notificationRecord.id,
       title: notificationRecord.title,
       body: notificationRecord.message,
-      icon: '/asdc-logo.png',
-      badge: '/icons/icon-192.png',
-      url: notificationRecord.url || '/',
+      icon: absoluteIcon,
+      badge: absoluteBadge,
+      image: absoluteIcon,
+      url: targetUrl,
       tag: notificationRecord.id,
       category: notificationRecord.category,
       silent: false,
+      vibrate: [200, 100, 200],
+      // FCM compatibility structure
+      notification: {
+        title: notificationRecord.title,
+        body: notificationRecord.message,
+        icon: absoluteIcon,
+        click_action: targetUrl,
+      },
+      data: {
+        id: notificationRecord.id,
+        title: notificationRecord.title,
+        body: notificationRecord.message,
+        url: targetUrl,
+        category: notificationRecord.category,
+      },
     });
+
+    const pushOptions = {
+      TTL: 86400, // 24-hour persistence if device is offline
+      urgency: 'high' as const, // High urgency wakes up device from Doze mode like WhatsApp
+      topic: 'asdc_broadcast',
+      headers: {
+        Urgency: 'high',
+      },
+    };
 
     let deliveredCount = 0;
     let expiredCount = 0;
@@ -363,12 +395,13 @@ export async function POST(request: NextRequest) {
               auth: sub.keys.auth,
             },
           },
-          pushPayload
+          pushPayload,
+          pushOptions
         );
         deliveredCount++;
       } catch (pushErr: any) {
-        // HTTP 410 (Gone) or 404 (Not Found) means expired/unregistered token
-        if (pushErr.statusCode === 410 || pushErr.statusCode === 404) {
+        // HTTP 410 (Gone), 404 (Not Found), or 403 (mismatched/unregistered key)
+        if (pushErr.statusCode === 410 || pushErr.statusCode === 404 || pushErr.statusCode === 403) {
           expiredCount++;
           await removeExpiredSubscription(sub.uid, idToken!);
         } else {

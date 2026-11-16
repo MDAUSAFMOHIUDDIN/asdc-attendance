@@ -104,15 +104,24 @@ export function NotificationComposerModal({
         throw new Error(data.error || 'Failed to dispatch notification.');
       }
 
+      let feedbackText = data.message || 'Notification broadcasted and delivered successfully.';
+      if (typeof data.deliveredCount === 'number') {
+        if (data.deliveredCount > 0) {
+          feedbackText = `✓ Push delivered to ${data.deliveredCount} active student device(s) and saved to database.`;
+        } else {
+          feedbackText = `✓ Notification saved to database. Note: 0 active student devices currently subscribed. Students must tap "Enable Phone Notifications" on their dashboard to receive device push alerts.`;
+        }
+      }
+
       setStatusMessage({
         type: 'success',
-        text: data.message || 'Notification broadcasted and delivered successfully.',
+        text: feedbackText,
       });
 
       setTimeout(() => {
         if (onSuccess) onSuccess();
         onClose();
-      }, 1500);
+      }, 2500);
     } catch (err: any) {
       console.error('[NotificationComposer] Submit error:', err);
       setStatusMessage({

@@ -61,10 +61,36 @@ export async function registerPushSubscription(uid: string): Promise<PushSubscri
     }
 
     const registration = await navigator.serviceWorker.ready;
+    const convertedVapidKey = urlBase64ToUint8Array(VAPID_PUBLIC_KEY);
     let subscription = await registration.pushManager.getSubscription();
 
+    // Verify existing subscription's VAPID applicationServerKey matches current key
+    if (subscription) {
+      try {
+        const rawKey = subscription.options?.applicationServerKey;
+        if (rawKey) {
+          const existingKeyBytes = new Uint8Array(rawKey);
+          let keyMatches = existingKeyBytes.length === convertedVapidKey.length;
+          if (keyMatches) {
+            for (let i = 0; i < existingKeyBytes.length; i++) {
+              if (existingKeyBytes[i] !== convertedVapidKey[i]) {
+                keyMatches = false;
+                break;
+              }
+            }
+          }
+          if (!keyMatches) {
+            console.log('[Push] ApplicationServerKey mismatch detected; refreshing push subscription');
+            await subscription.unsubscribe();
+            subscription = null;
+          }
+        }
+      } catch (keyErr) {
+        console.warn('[Push] Error validating subscription key:', keyErr);
+      }
+    }
+
     if (!subscription) {
-      const convertedVapidKey = urlBase64ToUint8Array(VAPID_PUBLIC_KEY);
       subscription = await registration.pushManager.subscribe({
         userVisibleOnly: true,
         applicationServerKey: convertedVapidKey as BufferSource,
@@ -117,13 +143,29 @@ export async function registerPushSubscription(uid: string): Promise<PushSubscri
     if (!response.ok) {
       console.warn('[Push] Backend subscription registration note:', await response.text());
     } else {
-      console.log('[Push] Successfully subscribed to push notifications');
+      console.log('[Push] Successfully subscribed device to push notifications');
     }
 
     return subscription;
   } catch (error) {
     console.error('[Push] Error registering push subscription:', error);
     return null;
+  }
+}
+
+/**
+ * Automatically sync device push subscription if permission was already granted
+ */
+export async function autoRegisterPushIfPermitted(uid: string): Promise<boolean> {
+  if (!isPushSupported() || !uid) return false;
+  if (Notification.permission !== 'granted') return false;
+
+  try {
+    const sub = await registerPushSubscription(uid);
+    return Boolean(sub);
+  } catch (err) {
+    console.warn('[Push] Auto-registration notice:', err);
+    return false;
   }
 }
 
@@ -195,6 +237,30 @@ export function subscribeToNotifications(
                   playNotificationChime(change.doc.id);
                   if (onNewAlert) {
                     onNewAlert({ ...fresh, id: change.doc.id });
+                  }
+
+                  // Foreground system notification: display real device notification via service worker
+                  if (
+                    typeof window !== 'undefined' &&
+                    'Notification' in window &&
+                    Notification.permission === 'granted' &&
+                    'serviceWorker' in navigator
+                  ) {
+                    navigator.serviceWorker.ready.then((reg) => {
+                      const origin = window.location.origin;
+                      const iconUrl = new URL('/asdc-logo.png', origin).href;
+                      const badgeUrl = new URL('/icons/icon-192.png', origin).href;
+                      reg.showNotification(fresh.title, {
+                        body: fresh.message,
+                        icon: iconUrl,
+                        badge: badgeUrl,
+                        tag: change.doc.id,
+                        silent: false,
+                        renotify: true,
+                        vibrate: [200, 100, 200],
+                        data: { id: change.doc.id, url: fresh.url || '/' },
+                      } as NotificationOptions).catch((e) => console.warn('[Notifications] Foreground showNotification note:', e));
+                    }).catch(() => {});
                   }
                 }
               }

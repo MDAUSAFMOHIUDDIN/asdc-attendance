@@ -23,6 +23,7 @@ import {
   isPushSupported,
   getPushPermissionState,
   registerPushSubscription,
+  autoRegisterPushIfPermitted,
 } from '@/lib/push-notification-service';
 import {
   isNotificationAudioEnabled,
@@ -50,8 +51,12 @@ export function StudentNotificationCenter({
 
   useEffect(() => {
     setSoundEnabled(isNotificationAudioEnabled());
-    setPermissionState(getPushPermissionState());
-  }, []);
+    const perm = getPushPermissionState();
+    setPermissionState(perm);
+    if (perm === 'granted' && studentUid) {
+      autoRegisterPushIfPermitted(studentUid).catch(() => {});
+    }
+  }, [studentUid]);
 
   // Handle incoming real-time notifications
   const handleNewAlert = useCallback(

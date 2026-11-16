@@ -105,23 +105,45 @@ self.addEventListener('fetch', (event) => {
   );
 });
 
-// Real Web Push Notifications Handler with Native OS Sound & Deduplication
+// Real Web Push & FCM Notifications Handler with Native OS Sound & Deduplication
 self.addEventListener('push', (event) => {
+  const origin = self.location.origin;
+  const defaultIcon = new URL('/asdc-logo.png', origin).href;
+  const defaultBadge = new URL('/icons/icon-192.png', origin).href;
+
   let data = {
     id: `notif_${Date.now()}`,
     title: 'ASDC Attendance Notification',
     body: 'New official update from ASDC administration.',
     url: '/',
-    icon: '/asdc-logo.png',
-    badge: '/icons/icon-192.png',
+    icon: defaultIcon,
+    badge: defaultBadge,
   };
 
   if (event.data) {
     try {
       const parsed = event.data.json();
-      data = { ...data, ...parsed };
+      // Support standard WebPush, FCM notification, and FCM data payloads
+      const notifObj = parsed.notification || {};
+      const dataObj = parsed.data || {};
+
+      const rawIcon = notifObj.icon || notifObj.image || dataObj.icon || parsed.icon || data.icon;
+      const rawBadge = notifObj.badge || dataObj.badge || parsed.badge || data.badge;
+      const rawUrl = parsed.url || dataObj.url || notifObj.click_action || parsed.click_action || '/';
+
+      data = {
+        ...data,
+        ...parsed,
+        id: parsed.id || dataObj.id || data.id,
+        title: notifObj.title || dataObj.title || parsed.title || data.title,
+        body: notifObj.body || dataObj.body || parsed.body || data.body,
+        icon: rawIcon ? (rawIcon.startsWith('http') ? rawIcon : new URL(rawIcon, origin).href) : defaultIcon,
+        badge: rawBadge ? (rawBadge.startsWith('http') ? rawBadge : new URL(rawBadge, origin).href) : defaultBadge,
+        url: rawUrl ? (rawUrl.startsWith('http') ? rawUrl : new URL(rawUrl, origin).href) : new URL('/', origin).href,
+      };
     } catch {
-      data.body = event.data.text() || data.body;
+      const text = event.data.text();
+      if (text) data.body = text;
     }
   }
 
@@ -129,12 +151,14 @@ self.addEventListener('push', (event) => {
 
   const options = {
     body: data.body,
-    icon: data.icon || '/asdc-logo.png',
-    badge: data.badge || '/icons/icon-192.png',
-    silent: false, // Explicitly false to trigger OS notification sound
+    icon: data.icon || defaultIcon,
+    badge: data.badge || defaultBadge,
+    image: data.icon || defaultIcon,
+    silent: false, // Explicitly false to trigger native OS notification sound
     renotify: true, // Alerts the user even if an older notification with the same tag exists
     tag: notificationTag, // Prevents duplicate notification stacking
     vibrate: [200, 100, 200], // Tactile alert on supported mobile devices
+    requireInteraction: false,
     data: {
       id: data.id,
       url: data.url || '/',
@@ -147,7 +171,7 @@ self.addEventListener('push', (event) => {
     ],
   };
 
-  // 1. Notify all active foreground client windows to update UI and play in-app chime
+  // 1. Notify all active foreground client windows to update in-app UI and chime
   const notifyClientsPromise = self.clients
     .matchAll({ type: 'window', includeUncontrolled: true })
     .then((windowClients) => {
@@ -160,12 +184,34 @@ self.addEventListener('push', (event) => {
           },
         });
       });
-    });
+    })
+    .catch((err) => console.warn('[ASDC SW] Client notification note:', err));
 
-  // 2. Display native operating system notification
-  const showNotificationPromise = self.registration.showNotification(data.title, options);
+  // 2. Display native operating system notification with resilient fallback
+  const displayNotificationPromise = (async () => {
+    try {
+      await self.registration.showNotification(data.title, options);
+    } catch (showErr) {
+      console.warn('[ASDC SW] showNotification with actions failed, retrying without actions:', showErr);
+      const safeOptions = {
+        body: options.body,
+        icon: options.icon,
+        badge: options.badge,
+        silent: false,
+        renotify: true,
+        tag: notificationTag,
+        vibrate: [200, 100, 200],
+        data: options.data,
+      };
+      try {
+        await self.registration.showNotification(data.title, safeOptions);
+      } catch (finalErr) {
+        console.error('[ASDC SW] Failed to show system notification:', finalErr);
+      }
+    }
+  })();
 
-  event.waitUntil(Promise.all([notifyClientsPromise, showNotificationPromise]));
+  event.waitUntil(Promise.all([notifyClientsPromise, displayNotificationPromise]));
 });
 
 // Notification Click Handler: Focus app or open URL
@@ -176,20 +222,23 @@ self.addEventListener('notificationclick', (event) => {
     return;
   }
 
-  const targetUrl = event.notification.data?.url || '/';
+  const origin = self.location.origin;
+  const rawUrl = event.notification.data?.url || '/';
+  const targetUrl = rawUrl.startsWith('http') ? rawUrl : new URL(rawUrl, origin).href;
 
   event.waitUntil(
     clients.matchAll({ type: 'window', includeUncontrolled: true }).then((clientList) => {
-      // If a window is already open, focus it and navigate
+      // If a window is already open on our origin, focus it
       for (const client of clientList) {
-        if (client.url && 'focus' in client) {
-          if ('navigate' in client && targetUrl) {
-            client.navigate(targetUrl);
-          }
+        if (client.url && client.url.startsWith(origin) && 'focus' in client) {
+          client.postMessage({
+            type: 'NOTIFICATION_CLICKED',
+            notificationId: event.notification.data?.id,
+          });
           return client.focus();
         }
       }
-      // Otherwise open a new window
+      // Otherwise open a new window to the target URL
       if (clients.openWindow) {
         return clients.openWindow(targetUrl);
       }

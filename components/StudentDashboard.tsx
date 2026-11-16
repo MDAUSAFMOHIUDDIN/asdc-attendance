@@ -8,6 +8,8 @@ import {
   XCircle,
   Clock,
   Bell,
+  BellRing,
+  Smartphone,
   LogOut,
   GraduationCap,
   Sparkles,
@@ -22,6 +24,12 @@ import { doc, onSnapshot, collection, query, where } from 'firebase/firestore';
 import { QRScannerModal } from './QRScannerModal';
 import { NotificationPanel } from './NotificationPanel';
 import { StudentNotificationCenter } from './StudentNotificationCenter';
+import {
+  registerPushSubscription,
+  getPushPermissionState,
+  autoRegisterPushIfPermitted,
+} from '@/lib/push-notification-service';
+import { enableAndTestNotificationAudio } from '@/lib/notification-audio';
 
 interface StudentDashboardProps {
   student: StudentProfile;
@@ -43,6 +51,40 @@ export function StudentDashboard({
   const [windowStatus, setWindowStatus] = useState(checkAttendanceWindow());
   const [profileModalOpen, setProfileModalOpen] = useState(false);
   const [qrAccessStatus, setQrAccessStatus] = useState<'ENABLED' | 'DISABLED'>('ENABLED');
+
+  // Push Notification Device Registration State
+  const [pushPermission, setPushPermission] = useState<NotificationPermission | 'unsupported'>('default');
+  const [pushEnabling, setPushEnabling] = useState(false);
+  const [pushSuccessBanner, setPushSuccessBanner] = useState(false);
+
+  // Automatic push registration if permission already granted
+  useEffect(() => {
+    if (typeof window !== 'undefined' && 'Notification' in window) {
+      const current = Notification.permission;
+      setPushPermission(current);
+      if (current === 'granted') {
+        autoRegisterPushIfPermitted(student.uid).catch((err) =>
+          console.warn('[Push] Auto-register notice:', err)
+        );
+      }
+    }
+  }, [student.uid]);
+
+  const handleEnableDevicePush = async () => {
+    setPushEnabling(true);
+    try {
+      enableAndTestNotificationAudio();
+      const sub = await registerPushSubscription(student.uid);
+      const perm = getPushPermissionState();
+      setPushPermission(perm);
+      if (sub && perm === 'granted') {
+        setPushSuccessBanner(true);
+        setTimeout(() => setPushSuccessBanner(false), 6000);
+      }
+    } finally {
+      setPushEnabling(false);
+    }
+  };
 
   // Real-time listener for Administrator QR Access ON/OFF state
   useEffect(() => {
@@ -273,6 +315,63 @@ export function StudentDashboard({
 
       {/* Main Container */}
       <main className="max-w-4xl mx-auto w-full px-4 sm:px-6 pt-6 space-y-6">
+        {/* Real Device Push Notification Activation & Status Banners */}
+        {pushSuccessBanner && (
+          <div className="bg-emerald-600 text-white rounded-2xl p-4 shadow-sm flex items-center justify-between gap-3 animate-fadeIn">
+            <div className="flex items-center gap-3">
+              <CheckCircle className="w-5 h-5 flex-shrink-0" />
+              <div>
+                <p className="text-xs sm:text-sm font-bold">Device Push Notifications Activated!</p>
+                <p className="text-[11px] text-emerald-100">
+                  You will now receive instant push alerts on your phone screen like WhatsApp.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={() => setPushSuccessBanner(false)}
+              className="text-white/80 hover:text-white text-xs font-bold px-2 py-1"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {pushPermission === 'default' && (
+          <div className="bg-gradient-to-r from-blue-600 to-indigo-600 text-white rounded-2xl p-4 sm:p-5 shadow-sm flex flex-col sm:flex-row sm:items-center justify-between gap-4 border border-blue-500">
+            <div className="flex items-start sm:items-center gap-3">
+              <div className="w-10 h-10 rounded-xl bg-white/20 flex items-center justify-center flex-shrink-0">
+                <BellRing className="w-5 h-5 text-white animate-pulse" />
+              </div>
+              <div>
+                <h3 className="text-sm sm:text-base font-bold">
+                  Enable Real-Time Device Notifications
+                </h3>
+                <p className="text-xs text-blue-100 mt-0.5">
+                  Receive instant WhatsApp-style push alerts on your phone&apos;s notification drawer for attendance updates, announcements, and holiday notices.
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              disabled={pushEnabling}
+              onClick={handleEnableDevicePush}
+              className="px-4 py-2.5 bg-white text-blue-700 font-extrabold text-xs rounded-xl hover:bg-blue-50 transition shadow-sm whitespace-nowrap flex items-center justify-center gap-2 disabled:opacity-50"
+            >
+              <Smartphone className="w-4 h-4 text-blue-600" />
+              <span>{pushEnabling ? 'Enabling...' : 'Enable Phone Notifications'}</span>
+            </button>
+          </div>
+        )}
+
+        {pushPermission === 'denied' && (
+          <div className="bg-amber-50 border border-amber-200 rounded-2xl p-3.5 px-4 text-xs text-amber-900 flex items-center gap-2.5">
+            <Bell className="w-4 h-4 text-amber-700 flex-shrink-0" />
+            <p>
+              <strong>Phone notifications are blocked in your browser.</strong> To receive push alerts on your device, tap the lock/settings icon in your browser URL bar and set Notifications to &quot;Allow&quot;.
+            </p>
+          </div>
+        )}
+
         {/* Welcome & Student ID Banner */}
         <div className="relative overflow-hidden bg-slate-50 border border-slate-200 rounded-2xl p-5 sm:p-6 shadow-sm">
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
