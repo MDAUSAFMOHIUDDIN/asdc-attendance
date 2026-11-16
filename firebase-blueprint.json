@@ -334,6 +334,37 @@
         }
       },
       "required": ["batchId", "batchName", "classroomId"]
+    },
+    "PushSubscription": {
+      "title": "PushSubscription",
+      "description": "Student device push subscription endpoint for Web Push and FCM",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "maxLength": 128 },
+        "endpoint": { "type": "string" },
+        "keys": { "type": "object" },
+        "userAgent": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["uid", "endpoint", "keys"]
+    },
+    "NotificationItem": {
+      "title": "NotificationItem",
+      "description": "Targeted or broadcast push notification message",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "maxLength": 128 },
+        "title": { "type": "string", "maxLength": 150 },
+        "message": { "type": "string", "maxLength": 2000 },
+        "category": { "type": "string" },
+        "recipientUid": { "type": "string", "maxLength": 128 },
+        "recipientName": { "type": "string", "maxLength": 100 },
+        "createdAt": { "type": "string" },
+        "createdBy": { "type": "string", "maxLength": 150 },
+        "url": { "type": "string" },
+        "readBy": { "type": "array" }
+      },
+      "required": ["id", "title", "message", "category", "recipientUid", "createdAt", "createdBy"]
     }
   },
   "firestore": {
@@ -364,6 +395,14 @@
     "/settings/{settingId}": {
       "schema": "InstituteSettings",
       "description": "Institute and batch configuration"
+    },
+    "/push_subscriptions/{subId}": {
+      "schema": "PushSubscription",
+      "description": "Student device push subscription records"
+    },
+    "/notifications/{notificationId}": {
+      "schema": "NotificationItem",
+      "description": "Institutional notification items"
     }
   }
 }

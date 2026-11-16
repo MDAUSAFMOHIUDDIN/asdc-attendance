@@ -69,9 +69,11 @@ export function NotificationComposerModal({
       };
 
       // 2. Client-side database write with authenticated administrator session
+      let clientSaved = false;
       try {
         const notifRef = doc(db, 'notifications', notificationId);
         await setDoc(notifRef, notificationRecord);
+        clientSaved = true;
       } catch (clientWriteErr: any) {
         console.warn('[Notifications] Client write note:', clientWriteErr?.message);
       }
@@ -85,6 +87,7 @@ export function NotificationComposerModal({
         },
         body: JSON.stringify({
           idToken,
+          clientSaved,
           existingNotificationId: notificationId,
           adminEmail: currentUser.email || adminEmail,
           title: title.trim(),

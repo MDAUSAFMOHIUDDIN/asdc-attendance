@@ -68,6 +68,7 @@ async function verifyAdminIdToken(idToken: string): Promise<{ authorized: boolea
 
 /**
  * Save notification record to Firestore via authenticated REST API
+ * Supports standard createDocument (POST ?documentId=...) and PATCH fallback
  */
 async function saveNotificationToFirestore(
   notification: NotificationItem,
@@ -75,36 +76,59 @@ async function saveNotificationToFirestore(
 ): Promise<{ success: boolean; error?: string }> {
   try {
     const projectId = FIREBASE_CONFIG.projectId;
-    const url = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/notifications/${notification.id}`;
 
-    const res = await fetch(url, {
+    const fieldsPayload = {
+      fields: {
+        id: { stringValue: notification.id },
+        title: { stringValue: notification.title },
+        message: { stringValue: notification.message },
+        category: { stringValue: notification.category },
+        recipientUid: { stringValue: notification.recipientUid },
+        recipientName: { stringValue: notification.recipientName },
+        createdAt: { stringValue: notification.createdAt },
+        createdBy: { stringValue: notification.createdBy },
+        url: { stringValue: notification.url || '/' },
+        readBy: { arrayValue: { values: [] } },
+      },
+    };
+
+    // 1. Primary: Attempt creation via standard REST createDocument (POST .../notifications?documentId=...)
+    const createUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/notifications?documentId=${encodeURIComponent(notification.id)}`;
+    const createRes = await fetch(createUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${idToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(fieldsPayload),
+    });
+
+    if (createRes.ok) {
+      return { success: true };
+    }
+
+    // HTTP 409 Conflict: Document already exists in Firestore (e.g. written by client setDoc)
+    if (createRes.status === 409) {
+      return { success: true };
+    }
+
+    // 2. Secondary: Fallback to PATCH (upsert / update)
+    const patchUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/notifications/${encodeURIComponent(notification.id)}`;
+    const patchRes = await fetch(patchUrl, {
       method: 'PATCH',
       headers: {
         Authorization: `Bearer ${idToken}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify({
-        fields: {
-          id: { stringValue: notification.id },
-          title: { stringValue: notification.title },
-          message: { stringValue: notification.message },
-          category: { stringValue: notification.category },
-          recipientUid: { stringValue: notification.recipientUid },
-          recipientName: { stringValue: notification.recipientName },
-          createdAt: { stringValue: notification.createdAt },
-          createdBy: { stringValue: notification.createdBy },
-          url: { stringValue: notification.url || '/' },
-          readBy: { arrayValue: { values: [] } },
-        },
-      }),
+      body: JSON.stringify(fieldsPayload),
     });
 
-    if (!res.ok) {
-      const errText = await res.text();
-      return { success: false, error: `Firestore notification write rejected: ${errText}` };
+    if (patchRes.ok) {
+      return { success: true };
     }
 
-    return { success: true };
+    const errText = await patchRes.text();
+    return { success: false, error: `Firestore notification write rejected: ${errText}` };
   } catch (err: any) {
     return { success: false, error: err.message || 'Network error saving notification to Firestore.' };
   }
@@ -253,6 +277,7 @@ export async function POST(request: NextRequest) {
       recipientName = 'All Students',
       url = '/',
       existingNotificationId,
+      clientSaved = false,
     } = body;
 
     // 3. Input validation with meaningful error messages
@@ -289,13 +314,21 @@ export async function POST(request: NextRequest) {
     };
 
     // 5. Persist notification to Firestore via authenticated REST API
-    const saveResult = await saveNotificationToFirestore(notificationRecord, idToken);
-    if (!saveResult.success) {
-      console.error('[Notifications] Database save failed:', saveResult.error);
-      return NextResponse.json(
-        { error: `Database error: Could not save notification to Firestore: ${saveResult.error}` },
-        { status: 500 }
-      );
+    if (clientSaved) {
+      // Document was already written directly by the authenticated admin in the client session
+      // Run idempotent REST sync in background without blocking dispatch
+      saveNotificationToFirestore(notificationRecord, idToken).catch((err) => {
+        console.warn('[Notifications] Background REST sync note:', err);
+      });
+    } else {
+      const saveResult = await saveNotificationToFirestore(notificationRecord, idToken);
+      if (!saveResult.success) {
+        console.error('[Notifications] Database save failed:', saveResult.error);
+        return NextResponse.json(
+          { error: `Database error: Could not save notification to Firestore: ${saveResult.error}` },
+          { status: 500 }
+        );
+      }
     }
 
     // 6. Retrieve registered students' valid push subscriptions

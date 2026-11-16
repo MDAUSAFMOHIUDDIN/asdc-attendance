@@ -18,7 +18,7 @@ service cloud.firestore {
 
     // Strict Sole Admin Enforcement: ONLY mdausafmohiuddin@gmail.com
     function isAdmin() {
-      return isVerified() && (
+      return isSignedIn() && (
         request.auth.token.email.lower() == 'mdausafmohiuddin@gmail.com'
       );
     }
@@ -194,14 +194,13 @@ service cloud.firestore {
     match /notifications/{notificationId} {
       allow get: if isSignedIn() && isValidId(notificationId) && (
         isAdmin() ||
-        resource.data.recipientUid == 'ALL' ||
-        resource.data.recipientUid == request.auth.uid
+        (resource != null && (resource.data.recipientUid == 'ALL' || resource.data.recipientUid == request.auth.uid))
       );
       allow list: if isSignedIn();
       allow create: if isAdmin() && isValidId(notificationId);
       allow update: if isSignedIn() && isValidId(notificationId) && (
         isAdmin() ||
-        (resource.data.recipientUid == request.auth.uid || resource.data.recipientUid == 'ALL')
+        (resource != null && (resource.data.recipientUid == request.auth.uid || resource.data.recipientUid == 'ALL'))
       );
       allow delete: if isAdmin();
     }
