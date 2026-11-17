@@ -264,6 +264,7 @@ export async function POST(request: NextRequest) {
       },
       dbCommitStatus: 'COMMITTED',
       excelSyncStatus,
+      finalizationStatus: 'UNFINALIZED',
     };
 
     // If student passed Firebase Auth ID token, write to Firestore REST API with student's authenticated context
@@ -287,6 +288,7 @@ export async function POST(request: NextRequest) {
           eventId: { stringValue: eventId },
           dbCommitStatus: { stringValue: 'COMMITTED' },
           excelSyncStatus: { stringValue: excelSyncStatus },
+          finalizationStatus: { stringValue: 'UNFINALIZED' },
         };
         const restRes = await fetch(firestoreUrl, {
           method: 'PATCH',

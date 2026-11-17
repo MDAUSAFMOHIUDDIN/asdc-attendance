@@ -50,7 +50,20 @@ export interface AttendanceRecord {
   qrValidation?: QRValidationResult;
   dbCommitStatus?: 'COMMITTED' | 'PENDING' | 'FAILED';
   excelSyncStatus?: 'SYNCED' | 'PENDING' | 'FAILED';
+  finalizationStatus?: 'FINALIZED' | 'UNFINALIZED';
   correctionReason?: string;
+}
+
+export interface FinalizedDateRecord {
+  id: string; // YYYY-MM-DD
+  date: string; // YYYY-MM-DD
+  finalizedAt: string;
+  finalizedBy: string;
+  presentCount: number;
+  absentCount: number;
+  excusedCount?: number;
+  totalStudents: number;
+  status: 'FINALIZED';
 }
 
 export interface Announcement {

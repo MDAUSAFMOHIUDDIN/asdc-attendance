@@ -62,7 +62,7 @@ service cloud.firestore {
       data.keys().hasOnly([
         'id', 'studentUid', 'studentId', 'studentName', 'studentEmail', 'classDate', 'batchId', 'status', 'source',
         'verifiedAt', 'submittedAt', 'timestamp', 'eventId', 'locationVerification', 'qrValidation',
-        'dbCommitStatus', 'excelSyncStatus', 'correctionReason'
+        'dbCommitStatus', 'excelSyncStatus', 'finalizationStatus', 'correctionReason'
       ]) &&
       data.studentUid is string && data.studentUid.size() <= 128 &&
       data.studentId is string && data.studentId.size() <= 32 && data.studentId.matches('^[a-zA-Z0-9_\\-]+$') &&
@@ -171,6 +171,18 @@ service cloud.firestore {
       allow get: if isSignedIn() && isValidId(settingId);
       allow list: if isSignedIn();
       allow create, update, delete: if isAdmin() && isValidId(settingId);
+    }
+
+    // Finalized Dates (Admin can write, signed-in users can read)
+    match /finalized_dates/{dateId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isAdmin() && isValidId(dateId);
+    }
+
+    // Distributed Concurrency Locks (Serialized workbook updates across serverless instances)
+    match /locks/{lockId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isSignedIn() && isValidId(lockId);
     }
 
     // Real-Time Location Security Incidents (Only sole admin can read and review)

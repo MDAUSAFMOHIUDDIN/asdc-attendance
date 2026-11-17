@@ -1,22 +1,30 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { correctAttendanceEntryInMaster } from '@/lib/excel-master-service';
-import { isAuthorizedAdmin } from '@/lib/admin-config';
-import { db } from '@/lib/firebase';
-import { doc, setDoc } from 'firebase/firestore';
-import { AuditLog } from '@/lib/types';
+import { isAuthorizedAdmin, INSTITUTE_CONFIG } from '@/lib/admin-config';
+import { db, FIREBASE_CONFIG } from '@/lib/firebase';
+import { doc, setDoc, getDocs, collection, query, where, getDoc } from 'firebase/firestore';
+import { AuditLog, AttendanceRecord, StudentProfile } from '@/lib/types';
+
+export const dynamic = 'force-dynamic';
 
 export async function POST(request: NextRequest) {
   try {
+    const authHeader = request.headers.get('Authorization') || request.headers.get('authorization');
+    const idToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
+
     const body = await request.json();
-    const { adminEmail, row, date, newStatus, reason } = body;
+    const { adminEmail, row, studentId, studentName, date, newStatus, reason } = body;
 
     if (!isAuthorizedAdmin(adminEmail)) {
-      return NextResponse.json({ error: 'Unauthorized: Only authorized admin may correct attendance.' }, { status: 403 });
+      return NextResponse.json(
+        { error: 'Unauthorized: Only authorized administrator may correct attendance.' },
+        { status: 403 }
+      );
     }
 
-    if (!row || !date || newStatus === undefined || !reason) {
+    if (!date || newStatus === undefined || !reason) {
       return NextResponse.json(
-        { error: 'Missing required fields: row, date, newStatus, reason.' },
+        { error: 'Missing required fields: date, newStatus, reason.' },
         { status: 400 }
       );
     }
@@ -29,24 +37,120 @@ export async function POST(request: NextRequest) {
     }
 
     // 1. Correct in Master Excel Workbook
-    const result = await correctAttendanceEntryInMaster({
-      row: Number(row),
+    const excelResult = await correctAttendanceEntryInMaster({
+      row: row ? Number(row) : undefined,
+      studentId,
+      studentName,
       dateStr: date,
       newStatus,
-      reason,
+      reason: reason.trim(),
       adminEmail,
+      idToken,
     });
 
-    // 2. Record Audit Log in Firestore
+    const studentDisplayName = excelResult.studentName || studentName || 'Student';
+    const nowIso = new Date().toISOString();
+
+    // 2. Locate Student in Firestore to keep Authoritative Database 100% Synchronized
+    let targetStudent: StudentProfile | null = null;
     try {
-      const nowIso = new Date().toISOString();
-      const logId = `corr_${Date.now()}_r${row}`;
+      const snap = await getDocs(collection(db, 'students'));
+      snap.forEach((d) => {
+        const p = d.data() as StudentProfile;
+        if (studentId && p.studentId === studentId) {
+          targetStudent = p;
+        } else if (!targetStudent && studentDisplayName) {
+          const normA = p.fullName.toLowerCase().replace(/[\.\,\_\-\s]+/g, ' ').trim();
+          const normB = studentDisplayName.toLowerCase().replace(/[\.\,\_\-\s]+/g, ' ').trim();
+          if (normA === normB || normA.includes(normB) || normB.includes(normA)) {
+            targetStudent = p;
+          }
+        }
+      });
+    } catch (err) {
+      console.warn('[Correct API] Firestore student lookup notice:', err);
+    }
+
+    // 3. Update Authoritative Attendance Record in Firestore
+    if (targetStudent) {
+      const studentObj = targetStudent as StudentProfile;
+      const attendanceDocId = `${studentObj.uid}_${date}`;
+      const normalizedStatus =
+        newStatus === 'P'
+          ? 'PRESENT'
+          : newStatus === 'A'
+          ? 'ABSENT'
+          : newStatus === 'L'
+          ? 'EXCUSED'
+          : 'ABSENT';
+
+      const updatedRecord: AttendanceRecord = {
+        id: attendanceDocId,
+        studentUid: studentObj.uid,
+        studentId: studentObj.studentId,
+        studentName: studentObj.fullName,
+        studentEmail: studentObj.email,
+        classDate: date,
+        batchId: studentObj.batchId || INSTITUTE_CONFIG.DEFAULT_BATCH_ID,
+        status: normalizedStatus,
+        source: 'ADMIN_MANUAL',
+        verifiedAt: nowIso,
+        submittedAt: nowIso,
+        timestamp: nowIso,
+        eventId: `att_corr_${Date.now()}_${studentObj.studentId}`,
+        dbCommitStatus: 'COMMITTED',
+        excelSyncStatus: 'SYNCED',
+        finalizationStatus: 'FINALIZED',
+        correctionReason: reason.trim(),
+      };
+
+      try {
+        await setDoc(doc(db, 'attendance', attendanceDocId), updatedRecord);
+      } catch (sdkErr) {
+        console.warn('[Correct API] SDK record update note:', sdkErr);
+      }
+
+      if (idToken) {
+        try {
+          const restUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/attendance/${attendanceDocId}`;
+          await fetch(restUrl, {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              fields: {
+                id: { stringValue: updatedRecord.id },
+                studentUid: { stringValue: updatedRecord.studentUid },
+                studentId: { stringValue: updatedRecord.studentId },
+                studentName: { stringValue: updatedRecord.studentName },
+                studentEmail: { stringValue: updatedRecord.studentEmail },
+                classDate: { stringValue: updatedRecord.classDate },
+                batchId: { stringValue: updatedRecord.batchId },
+                status: { stringValue: updatedRecord.status },
+                source: { stringValue: updatedRecord.source },
+                verifiedAt: { stringValue: updatedRecord.verifiedAt },
+                submittedAt: { stringValue: updatedRecord.submittedAt || nowIso },
+                timestamp: { stringValue: nowIso },
+                eventId: { stringValue: updatedRecord.eventId || '' },
+                dbCommitStatus: { stringValue: 'COMMITTED' },
+                excelSyncStatus: { stringValue: 'SYNCED' },
+                finalizationStatus: { stringValue: 'FINALIZED' },
+                correctionReason: { stringValue: reason.trim() },
+              },
+            }),
+          });
+        } catch {}
+      }
+    }
+
+    // 4. Record Audit Log in Firestore
+    try {
+      const logId = `corr_${Date.now()}_r${excelResult.row}`;
       const auditLog: AuditLog = {
         id: logId,
         adminEmail,
         action: 'MASTER_EXCEL_CORRECTION',
-        targetStudentId: `ROW_${row}`,
-        targetStudentName: result.studentName,
+        targetStudentId: targetStudent ? (targetStudent as StudentProfile).studentId : `ROW_${excelResult.row}`,
+        targetStudentName: studentDisplayName,
         targetDate: date,
         newStatus: newStatus || 'EMPTY',
         reason: reason.trim(),
@@ -59,8 +163,8 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json({
       success: true,
-      message: `Successfully updated attendance for ${result.studentName} on ${date} to '${newStatus || 'Cleared'}'.`,
-      result,
+      message: `Successfully updated attendance for ${studentDisplayName} on ${date} to '${newStatus || 'Cleared'}'.`,
+      result: excelResult,
     });
   } catch (error) {
     console.error('Correction error:', error);

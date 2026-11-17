@@ -16,6 +16,7 @@ import {
   AuditLog,
   Announcement,
   Holiday,
+  FinalizedDateRecord,
   StudentAttendanceSummary,
   StudentProfile,
 } from './types';
@@ -62,12 +63,51 @@ export async function getAttendanceRecordsForDate(
     const recordsMap: Record<string, AttendanceRecord> = {};
     snap.forEach((d) => {
       const data = d.data() as AttendanceRecord;
-      recordsMap[data.studentUid] = data;
+      if (data) {
+        if (data.studentUid) recordsMap[data.studentUid] = data;
+        if (data.studentId) {
+          recordsMap[data.studentId] = data;
+          recordsMap[data.studentId.toUpperCase()] = data;
+        }
+      }
     });
     return recordsMap;
   } catch (error) {
     handleFirestoreError(error, OperationType.GET, 'attendance');
     return {};
+  }
+}
+
+/**
+ * Fetch all finalized dates from authoritative database
+ */
+export async function getFinalizedDates(): Promise<Record<string, FinalizedDateRecord>> {
+  try {
+    const snap = await getDocs(collection(db, 'finalized_dates'));
+    const map: Record<string, FinalizedDateRecord> = {};
+    snap.forEach((d) => {
+      const f = d.data() as FinalizedDateRecord;
+      if (f && f.date) {
+        map[f.date] = f;
+      }
+    });
+    return map;
+  } catch (error) {
+    console.warn('Finalized dates read notice:', error);
+    return {};
+  }
+}
+
+/**
+ * Check if a specific class date has been finalized by administrator
+ */
+export async function isDateFinalized(dateStr: string): Promise<boolean> {
+  try {
+    const docRef = doc(db, 'finalized_dates', dateStr);
+    const snap = await getDoc(docRef);
+    return snap.exists();
+  } catch {
+    return false;
   }
 }
 
@@ -165,9 +205,14 @@ export async function correctAttendanceRecord(params: {
   const nowIso = new Date().toISOString();
 
   let previousStatus: AttendanceStatus = 'ABSENT';
+  let existingFinalizationStatus: 'FINALIZED' | 'UNFINALIZED' = 'FINALIZED';
   const existingSnap = await getDoc(attendanceRef);
   if (existingSnap.exists()) {
-    previousStatus = (existingSnap.data() as AttendanceRecord).status;
+    const exData = existingSnap.data() as AttendanceRecord;
+    previousStatus = exData.status || 'ABSENT';
+    if (exData.finalizationStatus) {
+      existingFinalizationStatus = exData.finalizationStatus;
+    }
   }
 
   const updatedRecord: AttendanceRecord = {
@@ -181,13 +226,19 @@ export async function correctAttendanceRecord(params: {
     status: newStatus,
     source: 'ADMIN_MANUAL',
     verifiedAt: nowIso,
+    submittedAt: nowIso,
+    timestamp: nowIso,
+    eventId: `att_corr_${Date.now()}_${student.studentId}`,
+    dbCommitStatus: 'COMMITTED',
+    excelSyncStatus: 'SYNCED',
+    finalizationStatus: existingFinalizationStatus,
     correctionReason: reason.trim(),
   };
 
-  // Write attendance record
+  // 1. Write authoritative attendance record in Firestore
   await setDoc(attendanceRef, updatedRecord);
 
-  // Write audit log
+  // 2. Write audit log
   const logId = `log_${Date.now()}_${student.studentId}`;
   const logRef = doc(db, 'audit_logs', logId);
   const auditLog: AuditLog = {
@@ -204,6 +255,44 @@ export async function correctAttendanceRecord(params: {
   };
 
   await setDoc(logRef, auditLog);
+
+  // 3. Synchronize with Master Excel Register
+  try {
+    const excelStatus: 'P' | 'A' | 'L' | '' =
+      newStatus === 'PRESENT' || (newStatus as any) === 'P'
+        ? 'P'
+        : newStatus === 'ABSENT' || (newStatus as any) === 'A'
+        ? 'A'
+        : newStatus === 'EXCUSED' || (newStatus as any) === 'L'
+        ? 'L'
+        : '';
+
+    let idToken: string | null = null;
+    try {
+      const { auth } = await import('./firebase');
+      if (auth.currentUser) {
+        idToken = await auth.currentUser.getIdToken();
+      }
+    } catch {}
+
+    await fetch('/api/attendance/master-excel/correct', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(idToken ? { Authorization: `Bearer ${idToken}` } : {}),
+      },
+      body: JSON.stringify({
+        adminEmail,
+        studentId: student.studentId,
+        studentName: student.fullName,
+        date: classDate,
+        newStatus: excelStatus,
+        reason: reason.trim(),
+      }),
+    });
+  } catch (syncErr) {
+    console.warn('[Attendance Service] Master Excel correction sync notice:', syncErr);
+  }
 
   return updatedRecord;
 }
@@ -284,13 +373,25 @@ export function calculateStudentSummary(
   student: StudentProfile,
   records: AttendanceRecord[],
   holidays: Record<string, Holiday>,
+  finalizedDates?: Record<string, any> | Set<string> | string[],
   activeDaysOfWeek: number[] = INSTITUTE_CONFIG.DEFAULT_ACTIVE_DAYS_OF_WEEK
 ): StudentAttendanceSummary {
   // If student registered recently, count dates from student.createdAt date up to today (or last 30 days)
   const regDateStr = student.createdAt ? student.createdAt.split('T')[0] : '2026-10-01';
   const todayIST = getISTTimeInfo();
   const todayStr = todayIST.dateString;
-  const windowStatus = checkAttendanceWindow();
+
+  // Build finalized dates set
+  const finalizedSet = new Set<string>();
+  if (finalizedDates) {
+    if (finalizedDates instanceof Set) {
+      finalizedDates.forEach((d) => finalizedSet.add(d));
+    } else if (Array.isArray(finalizedDates)) {
+      finalizedDates.forEach((d) => finalizedSet.add(d));
+    } else if (typeof finalizedDates === 'object') {
+      Object.keys(finalizedDates).forEach((d) => finalizedSet.add(d));
+    }
+  }
 
   // Create lookup of recorded attendance
   const recordMap: Record<string, AttendanceRecord> = {};
@@ -304,7 +405,6 @@ export function calculateStudentSummary(
   let excusedCount = 0;
 
   // Iterate over relevant class dates (up to today)
-  // Let's generate past scheduled class dates since registration
   const [startYear, startMonth, startDay] = regDateStr.split('-').map(Number);
   const cursor = new Date(Date.UTC(startYear, startMonth - 1, startDay, 12, 0, 0));
   const end = new Date(Date.UTC(todayIST.year, todayIST.month - 1, todayIST.day, 12, 0, 0));
@@ -319,30 +419,33 @@ export function calculateStudentSummary(
 
     if (isClassDay) {
       const rec = recordMap[dateStr];
-      const isToday = dateStr === todayStr;
+      const isDateFinalized = finalizedSet.has(dateStr);
 
       if (rec) {
-        if (rec.status === 'PRESENT') {
+        const isPres = rec.status === 'PRESENT' || (rec.status as any) === 'P';
+        const isAbs = rec.status === 'ABSENT' || (rec.status as any) === 'A';
+        const isExc = rec.status === 'EXCUSED' || (rec.status as any) === 'L';
+
+        if (isPres) {
           presentCount++;
           totalScheduled++;
-        } else if (rec.status === 'EXCUSED') {
+        } else if (isExc) {
           excusedCount++;
-          // Excused does not penalize attendance
-        } else if (rec.status === 'ABSENT') {
+        } else if (isAbs) {
           absentCount++;
           totalScheduled++;
         }
       } else {
-        // No record exists
-        if (!isToday) {
-          // Past class day with no attendance record is Absent
+        // No record exists in DB for this date
+        // ONLY count as absent if date is explicitly finalized by administrator!
+        // Unfinalized dates are NOT marked absent before administrator confirmation.
+        if (isDateFinalized) {
           absentCount++;
           totalScheduled++;
         }
       }
     }
 
-    // Step forward one day
     cursor.setUTCDate(cursor.getUTCDate() + 1);
   }
 

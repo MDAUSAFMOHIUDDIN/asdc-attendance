@@ -49,6 +49,7 @@ import {
   finalizeMasterDailyAttendance,
   correctMasterAttendanceEntry,
   triggerMasterWorkbookDownload,
+  getFinalizedDates,
 } from '@/lib/attendance-service';
 import { auth, db } from '@/lib/firebase';
 import {
@@ -77,6 +78,7 @@ import {
   LocationIncident,
   QRAccessStatus,
   NotificationItem,
+  FinalizedDateRecord,
 } from '@/lib/types';
 import {
   getISTTimeInfo,
@@ -140,6 +142,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
   const [selectedDate, setSelectedDate] = useState<string>(todayIST.dateString);
   const [dailyAttendance, setDailyAttendance] = useState<Record<string, AttendanceRecord>>({});
   const [loadingAttendance, setLoadingAttendance] = useState(false);
+  const [finalizedDates, setFinalizedDates] = useState<Record<string, FinalizedDateRecord>>({});
 
   // Search & Filter
   const [searchQuery, setSearchQuery] = useState('');
@@ -455,6 +458,31 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
     };
   }, []);
 
+  // Real-Time Database Listener: Finalized Attendance Dates
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    try {
+      const colRef = collection(db, 'finalized_dates');
+      unsubscribe = onSnapshot(
+        colRef,
+        (snapshot) => {
+          const map: Record<string, FinalizedDateRecord> = {};
+          snapshot.forEach((d) => {
+            map[d.id] = d.data() as FinalizedDateRecord;
+          });
+          setFinalizedDates(map);
+        },
+        (err) => console.warn('Finalized dates listener note:', err)
+      );
+    } catch (err) {
+      console.warn('Could not initialize finalized dates listener:', err);
+    }
+
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
+
   useEffect(() => {
     loadActiveQR();
     loadGeofenceConfig();
@@ -671,6 +699,7 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
       await Promise.all([
         loadMasterData(selectedDate),
         loadAttendanceForSelectedDate(selectedDate),
+        getFinalizedDates().then((fin) => setFinalizedDates(fin)).catch(() => {}),
       ]);
     } catch (err) {
       setMasterFeedback({
@@ -742,19 +771,27 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
         (stuId ? dailyAttendance[stuId] || dailyAttendance[stuId.toUpperCase()] : undefined);
 
       if (rec) {
-        const normStatus = (rec.status === 'P' || rec.status === 'PRESENT') ? 'PRESENT' : (rec.status === 'A' || rec.status === 'ABSENT') ? 'ABSENT' : rec.status;
+        const raw = rec.status as string;
+        const normStatus: 'PRESENT' | 'ABSENT' | 'EXCUSED' =
+          raw === 'P' || raw === 'PRESENT'
+            ? 'PRESENT'
+            : raw === 'A' || raw === 'ABSENT'
+            ? 'ABSENT'
+            : 'EXCUSED';
         return { status: normStatus, record: rec };
       }
 
-      const isToday = selectedDate === todayIST.dateString;
-      if (isToday) {
-        return { status: 'NOT_RECORDED' };
+      // Check authoritative daily finalization status
+      const isFinalized = Boolean(finalizedDates[selectedDate]);
+      if (isFinalized) {
+        // Administrator has explicitly finalized this date, so unrecorded students are ABSENT
+        return { status: 'ABSENT' };
       }
 
-      // Past date with no record
-      return { status: 'ABSENT' };
+      // Date is not yet finalized (today or past unfinalized date): attendance is open/pending finalization
+      return { status: 'NOT_RECORDED' };
     },
-    [dailyAttendance, holidays, selectedDate, todayIST.dateString]
+    [dailyAttendance, holidays, selectedDate, finalizedDates]
   );
 
   // Filter students based on search and status
@@ -1206,6 +1243,17 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                     Holiday: {holidays[selectedDate]?.title}
                   </span>
                 )}
+                {finalizedDates[selectedDate] ? (
+                  <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-emerald-100 text-emerald-800 border border-emerald-200 flex items-center gap-1">
+                    <CheckCircle className="w-3 h-3 text-emerald-600" />
+                    Finalized ({formatDisplayTimestamp(finalizedDates[selectedDate].finalizedAt)})
+                  </span>
+                ) : (
+                  <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-amber-100 text-amber-800 border border-amber-200 flex items-center gap-1">
+                    <Clock className="w-3 h-3 text-amber-600" />
+                    Open / Pending Finalization
+                  </span>
+                )}
               </div>
 
               <div className="flex items-center gap-2">
@@ -1332,9 +1380,9 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                 <span className="text-[11px] text-slate-500 mt-2 block font-medium">
                   {metrics.isHoliday
                     ? 'No absences on declared holidays'
-                    : selectedDate === todayIST.dateString
-                    ? 'Attendance open anytime today'
-                    : 'Unrecorded / Past Absent'}
+                    : finalizedDates[selectedDate]
+                    ? 'Finalized absences'
+                    : 'Unfinalized (Open)'}
                 </span>
               </div>
 
@@ -1349,9 +1397,9 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                   <Clock className="w-5 h-5 text-amber-500" />
                 </div>
                 <span className="text-[11px] text-slate-500 mt-2 block font-medium">
-                  {selectedDate === todayIST.dateString
-                    ? 'Open for scanning 24/7'
-                    : 'Past dates resolved'}
+                  {finalizedDates[selectedDate]
+                    ? 'Date finalized'
+                    : 'Pending finalization'}
                 </span>
               </div>
             </div>

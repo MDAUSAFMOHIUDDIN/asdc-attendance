@@ -16,7 +16,13 @@ import {
   RefreshCw,
 } from 'lucide-react';
 import { StudentProfile, AttendanceRecord, Announcement, Holiday, StudentAttendanceSummary } from '@/lib/types';
-import { getStudentAttendanceRecords, getAnnouncements, getHolidays, calculateStudentSummary } from '@/lib/attendance-service';
+import {
+  getStudentAttendanceRecords,
+  getAnnouncements,
+  getHolidays,
+  getFinalizedDates,
+  calculateStudentSummary,
+} from '@/lib/attendance-service';
 import { formatDisplayDate, formatDisplayTimestamp, checkAttendanceWindow, getISTTimeInfo } from '@/lib/date-utils';
 import { INSTITUTE_CONFIG } from '@/lib/admin-config';
 import { db } from '@/lib/firebase';
@@ -45,6 +51,7 @@ export function StudentDashboard({
   const [records, setRecords] = useState<AttendanceRecord[]>([]);
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [holidays, setHolidays] = useState<Record<string, Holiday>>({});
+  const [finalizedDates, setFinalizedDates] = useState<Record<string, any>>({});
   const [loading, setLoading] = useState(true);
   const [scannerOpen, setScannerOpen] = useState(false);
   const [liveIstTime, setLiveIstTime] = useState<string>('');
@@ -140,14 +147,16 @@ export function StudentDashboard({
   const loadData = useCallback(async () => {
     try {
       setLoading(true);
-      const [recList, annList, holList] = await Promise.all([
+      const [recList, annList, holList, finList] = await Promise.all([
         getStudentAttendanceRecords(student.uid),
         getAnnouncements(),
         getHolidays(),
+        getFinalizedDates(),
       ]);
       setRecords(recList);
       setAnnouncements(annList);
       setHolidays(holList);
+      setFinalizedDates(finList);
     } catch (err) {
       console.error('Failed to load student data:', err);
     } finally {
@@ -183,6 +192,30 @@ export function StudentDashboard({
     };
   }, [student.uid]);
 
+  // Real-time listener for Finalized Dates
+  useEffect(() => {
+    let unsubscribe: (() => void) | undefined;
+    try {
+      const colRef = collection(db, 'finalized_dates');
+      unsubscribe = onSnapshot(
+        colRef,
+        (snapshot) => {
+          const map: Record<string, any> = {};
+          snapshot.forEach((d) => {
+            map[d.id] = d.data();
+          });
+          setFinalizedDates(map);
+        },
+        (err) => console.warn('Finalized dates student listener notice:', err)
+      );
+    } catch (err) {
+      console.warn('Could not initialize finalized dates listener for student:', err);
+    }
+    return () => {
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
+
   // Initial load with cleanup to prevent cascading renders
   useEffect(() => {
     let isMounted = true;
@@ -190,11 +223,13 @@ export function StudentDashboard({
       getStudentAttendanceRecords(student.uid),
       getAnnouncements(),
       getHolidays(),
-    ]).then(([recList, annList, holList]) => {
+      getFinalizedDates(),
+    ]).then(([recList, annList, holList, finList]) => {
       if (isMounted) {
         setRecords(recList);
         setAnnouncements(annList);
         setHolidays(holList);
+        setFinalizedDates(finList);
         setLoading(false);
       }
     }).catch(console.error);
@@ -208,6 +243,7 @@ export function StudentDashboard({
   const todayIST = getISTTimeInfo();
   const todayDateStr = todayIST.dateString;
   const isTodayHoliday = Boolean(holidays[todayDateStr]);
+  const isTodayFinalized = Boolean(finalizedDates[todayDateStr]);
   const todayRecord = records.find((r) => r.classDate === todayDateStr);
 
   let todayStatusDisplay = {
@@ -225,21 +261,28 @@ export function StudentDashboard({
       icon: Sparkles,
     };
   } else if (todayRecord) {
-    if (todayRecord.status === 'PRESENT' || todayRecord.status === 'P') {
+    if (todayRecord.dbCommitStatus === 'PENDING') {
+      todayStatusDisplay = {
+        label: 'PENDING DATABASE SYNC',
+        sub: 'Attendance submitted. Waiting for backend database confirmation...',
+        color: 'text-amber-800 bg-amber-50 border-amber-300',
+        icon: Clock,
+      };
+    } else if (todayRecord.status === 'PRESENT' || (todayRecord.status as any) === 'P') {
       todayStatusDisplay = {
         label: 'PRESENT',
         sub: `Verified via ${todayRecord.source === 'QR_SCAN' ? 'Classroom QR' : 'Institute Override'} at ${formatDisplayTimestamp(todayRecord.verifiedAt)}`,
         color: 'text-emerald-800 bg-emerald-50 border-emerald-300',
         icon: CheckCircle,
       };
-    } else if (todayRecord.status === 'ABSENT' || todayRecord.status === 'A') {
+    } else if (todayRecord.status === 'ABSENT' || (todayRecord.status as any) === 'A') {
       todayStatusDisplay = {
         label: 'ABSENT',
         sub: todayRecord.correctionReason ? `Note: ${todayRecord.correctionReason}` : 'Marked absent for this class date.',
         color: 'text-rose-800 bg-rose-50 border-rose-300',
         icon: XCircle,
       };
-    } else if (todayRecord.status === 'EXCUSED') {
+    } else if (todayRecord.status === 'EXCUSED' || (todayRecord.status as any) === 'L') {
       todayStatusDisplay = {
         label: 'EXCUSED',
         sub: todayRecord.correctionReason || 'Official Institute Leave',
@@ -247,13 +290,21 @@ export function StudentDashboard({
         icon: Sparkles,
       };
     }
+  } else if (isTodayFinalized) {
+    todayStatusDisplay = {
+      label: 'ABSENT',
+      sub: 'Attendance for today was finalized by administrator.',
+      color: 'text-rose-800 bg-rose-50 border-rose-300',
+      icon: XCircle,
+    };
   }
 
   // Summary Metrics
   const summary: StudentAttendanceSummary = calculateStudentSummary(
     student,
     records,
-    holidays
+    holidays,
+    finalizedDates
   );
 
   const unreadAnnouncementsCount = announcements.filter(
@@ -638,19 +689,19 @@ export function StudentDashboard({
                       <td className="px-4 py-3">
                         <span
                           className={`inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-md font-bold text-[11px] ${
-                            r.status === 'PRESENT'
+                            r.status === 'PRESENT' || (r.status as any) === 'P'
                               ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
-                              : r.status === 'EXCUSED'
+                              : r.status === 'EXCUSED' || (r.status as any) === 'L'
                               ? 'bg-blue-100 text-blue-800 border border-blue-200'
                               : 'bg-rose-100 text-rose-800 border border-rose-200'
                           }`}
                         >
-                          {r.status === 'PRESENT' ? (
+                          {r.status === 'PRESENT' || (r.status as any) === 'P' ? (
                             <CheckCircle className="w-3 h-3 text-emerald-700" />
                           ) : (
                             <XCircle className="w-3 h-3 text-rose-700" />
                           )}
-                          {r.status}
+                          {(r.status as string) === 'P' ? 'PRESENT' : (r.status as string) === 'A' ? 'ABSENT' : (r.status as string) === 'L' ? 'EXCUSED' : r.status}
                         </span>
                       </td>
                       <td className="px-4 py-3 text-slate-600 font-medium">

@@ -32,6 +32,85 @@ import type { AttendanceRecord } from './types.ts';
 
 const lock = new AsyncLock();
 
+/**
+ * Acquire distributed lock for Excel master workbook
+ * Serializes modifications across multiple concurrent Vercel serverless instances.
+ */
+async function acquireDistributedLock(lockId = 'excel_master', ttlMs = 30000, maxWaitMs = 12000): Promise<string> {
+  const token = `worker_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const lockRef = doc(db, 'locks', lockId);
+  const startTime = Date.now();
+
+  while (Date.now() - startTime < maxWaitMs) {
+    try {
+      const snap = await getDoc(lockRef);
+      const now = Date.now();
+      if (!snap.exists()) {
+        await setDoc(lockRef, {
+          isLocked: true,
+          lockedBy: token,
+          acquiredAt: new Date(now).toISOString(),
+          expiresAt: now + ttlMs,
+        });
+        return token;
+      }
+
+      const data = snap.data();
+      const isExpired = !data?.expiresAt || now > data.expiresAt;
+      if (!data?.isLocked || isExpired) {
+        await setDoc(lockRef, {
+          isLocked: true,
+          lockedBy: token,
+          acquiredAt: new Date(now).toISOString(),
+          expiresAt: now + ttlMs,
+        });
+        return token;
+      }
+    } catch (err) {
+      // If Firestore locks collection is restricted/unavailable, fallback to in-memory lock
+      break;
+    }
+
+    await new Promise((r) => setTimeout(r, 250));
+  }
+
+  return token;
+}
+
+async function releaseDistributedLock(lockId = 'excel_master', token: string): Promise<void> {
+  try {
+    const lockRef = doc(db, 'locks', lockId);
+    const snap = await getDoc(lockRef);
+    if (snap.exists() && snap.data()?.lockedBy === token) {
+      await setDoc(lockRef, { isLocked: false, lockedBy: null, releasedAt: new Date().toISOString() }, { merge: true });
+    }
+  } catch (err) {
+    // Release notice
+  }
+}
+
+/**
+ * Helper to execute an operation serialized across both in-process and distributed locks
+ */
+export async function withMasterLock<T>(fn: () => Promise<T>): Promise<T> {
+  return lock.acquire('master-workbook', async () => {
+    let token: string | null = null;
+    try {
+      token = await acquireDistributedLock('excel_master');
+    } catch {}
+
+    try {
+      return await fn();
+    } finally {
+      if (token) {
+        try {
+          await releaseDistributedLock('excel_master', token);
+        } catch {}
+      }
+    }
+  });
+}
+
 // Canonical cloud storage object paths in Firebase Storage
 export const CANONICAL_STORAGE_FILE = 'master-attendance/master-attendance.xlsx';
 export const CANONICAL_STORAGE_META = 'master-attendance/master-meta.json';
@@ -841,9 +920,18 @@ export function matchStudentToExcelRow(
   const cleanInput = normalize(student.fullName);
   const expandedInput = expandAliases(cleanInput);
 
+  // Helper to record verified mapping in metadata
+  const recordMapping = (matchedRow: ExcelStudentRow) => {
+    if (student.studentId && meta.studentMappings[student.studentId] !== matchedRow.row) {
+      meta.studentMappings[student.studentId] = matchedRow.row;
+      saveMetaLocally(meta);
+    }
+    return matchedRow;
+  };
+
   // 3a. Exact string match on normalized name
   const exactMatches = studentsInWorkbook.filter((s) => normalize(s.name) === cleanInput);
-  if (exactMatches.length === 1) return exactMatches[0];
+  if (exactMatches.length === 1) return recordMapping(exactMatches[0]);
   if (exactMatches.length > 1) {
     console.warn(`[Excel Match] Ambiguous exact name match: multiple rows match '${student.fullName}'`);
     return null;
@@ -851,7 +939,7 @@ export function matchStudentToExcelRow(
 
   // 3b. Exact match on alias-expanded name (e.g. Mohd -> Mohammed)
   const aliasMatches = studentsInWorkbook.filter((s) => expandAliases(normalize(s.name)) === expandedInput);
-  if (aliasMatches.length === 1) return aliasMatches[0];
+  if (aliasMatches.length === 1) return recordMapping(aliasMatches[0]);
   if (aliasMatches.length > 1) {
     console.warn(`[Excel Match] Ambiguous alias match: multiple rows match '${student.fullName}'`);
     return null;
@@ -866,7 +954,7 @@ export function matchStudentToExcelRow(
     return inputWords.every((w) => sWordSet.has(w));
   });
 
-  if (tokenMatches.length === 1) return tokenMatches[0];
+  if (tokenMatches.length === 1) return recordMapping(tokenMatches[0]);
   if (tokenMatches.length > 1) {
     console.warn(`[Excel Match] Ambiguous token match: multiple rows match '${student.fullName}'`);
     return null;
@@ -991,28 +1079,28 @@ function recalculateStudentRow(
   const totalClasses = 90;
   const percentage = totalClasses > 0 ? (presentCount / totalClasses) : 0;
 
-  // Replace H (Present)
+  // Cleanly replace H (Present)
   rowContent = rowContent.replace(
-    new RegExp(`(<c\\b[^>]*r="H${rowNum}"[^>]*>)(?:[\\s\\S]*?<v>[^<]*<\\/v>)?([\\s\\S]*?<\\/c>)`),
-    `$1<f>COUNTIF(L${rowNum}:DP${rowNum},"p")</f><v>${presentCount}</v></c>`
+    new RegExp(`<c\\b[^>]*r="H${rowNum}"[^>]*?(?:\\/>|>[\\s\\S]*?<\\/c>)`),
+    `<c r="H${rowNum}" s="15"><f>COUNTIF(L${rowNum}:DP${rowNum},"p")</f><v>${presentCount}</v></c>`
   );
 
-  // Replace I (Absent)
+  // Cleanly replace I (Absent)
   rowContent = rowContent.replace(
-    new RegExp(`(<c\\b[^>]*r="I${rowNum}"[^>]*>)(?:[\\s\\S]*?<v>[^<]*<\\/v>)?([\\s\\S]*?<\\/c>)`),
-    `$1<f>COUNTIF(L${rowNum}:DP${rowNum},"A")</f><v>${absentCount}</v></c>`
+    new RegExp(`<c\\b[^>]*r="I${rowNum}"[^>]*?(?:\\/>|>[\\s\\S]*?<\\/c>)`),
+    `<c r="I${rowNum}" s="15"><f>COUNTIF(L${rowNum}:DP${rowNum},"A")</f><v>${absentCount}</v></c>`
   );
 
-  // Replace J (Leave)
+  // Cleanly replace J (Leave)
   rowContent = rowContent.replace(
-    new RegExp(`(<c\\b[^>]*r="J${rowNum}"[^>]*>)(?:[\\s\\S]*?<v>[^<]*<\\/v>)?([\\s\\S]*?<\\/c>)`),
-    `$1<f>COUNTIF(L${rowNum}:DP${rowNum},"L")</f><v>${leaveCount}</v></c>`
+    new RegExp(`<c\\b[^>]*r="J${rowNum}"[^>]*?(?:\\/>|>[\\s\\S]*?<\\/c>)`),
+    `<c r="J${rowNum}" s="15"><f>COUNTIF(L${rowNum}:DP${rowNum},"L")</f><v>${leaveCount}</v></c>`
   );
 
-  // Replace K (%)
+  // Cleanly replace K (%)
   rowContent = rowContent.replace(
-    new RegExp(`(<c\\b[^>]*r="K${rowNum}"[^>]*>)(?:[\\s\\S]*?<v>[^<]*<\\/v>)?([\\s\\S]*?<\\/c>)`),
-    `$1<f>H${rowNum}/G${rowNum}</f><v>${percentage}</v></c>`
+    new RegExp(`<c\\b[^>]*r="K${rowNum}"[^>]*?(?:\\/>|>[\\s\\S]*?<\\/c>)`),
+    `<c r="K${rowNum}" s="19"><f>H${rowNum}/G${rowNum}</f><v>${percentage}</v></c>`
   );
 
   return rowContent;
@@ -1022,7 +1110,7 @@ function recalculateStudentRow(
  * Public: Get Master Workbook Info and current status
  */
 export async function getMasterWorkbookInfo(): Promise<MasterWorkbookInfo> {
-  return lock.acquire('master-workbook', async () => {
+  return withMasterLock(async () => {
     await ensureMasterWorkbook();
     const meta = await syncLatestMeta();
     const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
@@ -1062,7 +1150,7 @@ export async function getMasterAttendanceForDate(dateStr: string): Promise<{
   unmarkedCount: number;
   records: DateAttendanceRecord[];
 }> {
-  return lock.acquire('master-workbook', async () => {
+  return withMasterLock(async () => {
     await ensureMasterWorkbook();
     const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
     const sheetXml = fs.readFileSync(sheet1Path, 'utf8');
@@ -1139,7 +1227,7 @@ export async function recordStudentAttendanceInMaster(
   dateStr: string,
   status: 'P' | 'A' | 'L' = 'P'
 ): Promise<{ success: boolean; row: number; column: string; alreadyRecorded: boolean; message: string }> {
-  return lock.acquire('master-workbook', async () => {
+  return withMasterLock(async () => {
     await syncFromStorage();
     const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
     let sheetXml = fs.readFileSync(sheet1Path, 'utf8');
@@ -1237,7 +1325,7 @@ export async function finalizeDailyAttendanceInMaster(
     throw new Error('Unauthorized: Only authorized administrator may finalize attendance.');
   }
 
-  return lock.acquire('master-workbook', async () => {
+  return withMasterLock(async () => {
     await syncFromStorage();
     const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
     let sheetXml = fs.readFileSync(sheet1Path, 'utf8');
@@ -1295,10 +1383,18 @@ export async function finalizeDailyAttendanceInMaster(
       else if (currentText === 'L' || currentText === 'l') currentStatus = 'L';
 
       let finalStatus: 'P' | 'A' | 'L';
-      if (presentRowSet.has(s.row) || currentStatus === 'P') {
+      if (presentRowSet.has(s.row)) {
         finalStatus = 'P';
         presentCount++;
-      } else if (leaveRowSet.has(s.row) || currentStatus === 'L') {
+      } else if (leaveRowSet.has(s.row)) {
+        finalStatus = 'L';
+      } else if (absentRowSet.has(s.row)) {
+        finalStatus = 'A';
+        absentCount++;
+      } else if (currentStatus === 'P') {
+        finalStatus = 'P';
+        presentCount++;
+      } else if (currentStatus === 'L') {
         finalStatus = 'L';
       } else {
         finalStatus = 'A';
@@ -1378,7 +1474,7 @@ export async function reconcileAllDatesInMaster(params: {
 }> {
   const { allAttendanceRecords, finalizedDates = [], idToken } = params;
 
-  return lock.acquire('master-workbook', async () => {
+  return withMasterLock(async () => {
     await syncFromStorage();
     const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
     let sheetXml = fs.readFileSync(sheet1Path, 'utf8');
@@ -1495,6 +1591,11 @@ export async function reconcileAllDatesInMaster(params: {
           const updatedCellXml = `<c r="${cellRef}" s="20" t="s"><v>${stringId}</v></c>`;
           rowContent = setCellInRow(rowContent, cellRef, colName, updatedCellXml);
           totalUpdatedCells++;
+        } else if (currentVal !== null) {
+          // Unfinalized date without record: clear any stale value
+          const emptyCellXml = `<c r="${cellRef}" s="20"/>`;
+          rowContent = setCellInRow(rowContent, cellRef, colName, emptyCellXml);
+          totalUpdatedCells++;
         }
 
         sheetXml = sheetXml.replace(rowRegex, `${rowMatch[1]}${rowContent}${rowMatch[3]}`);
@@ -1553,13 +1654,16 @@ export async function reconcileAllDatesInMaster(params: {
  * Requires mandatory audit reason.
  */
 export async function correctAttendanceEntryInMaster(params: {
-  row: number;
+  row?: number;
+  studentId?: string;
+  studentName?: string;
   dateStr: string;
   newStatus: 'P' | 'A' | 'L' | '';
   reason: string;
   adminEmail: string;
+  idToken?: string | null;
 }): Promise<{ success: boolean; studentName: string; row: number; cellRef: string; version: number }> {
-  const { row, dateStr, newStatus, reason, adminEmail } = params;
+  const { row: inputRow, studentId, studentName, dateStr, newStatus, reason, adminEmail, idToken } = params;
 
   if (!isAuthorizedAdmin(adminEmail)) {
     throw new Error('Unauthorized: Only authorized administrator may correct attendance.');
@@ -1569,7 +1673,7 @@ export async function correctAttendanceEntryInMaster(params: {
     throw new Error('Mandatory audit reason must be at least 5 characters.');
   }
 
-  return lock.acquire('master-workbook', async () => {
+  return withMasterLock(async () => {
     await syncFromStorage();
     const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
     let sheetXml = fs.readFileSync(sheet1Path, 'utf8');
@@ -1578,6 +1682,23 @@ export async function correctAttendanceEntryInMaster(params: {
     const dateInfo = parseDateColumns(sheetXml);
     const { updatedSheetXml, colName } = ensureDateColumn(sheetXml, dateStr, dateInfo);
     sheetXml = updatedSheetXml;
+
+    const students = parseStudents(sheetXml, sharedStrings);
+
+    let row = inputRow;
+    let studentObj = row ? students.find((s) => s.row === row) : undefined;
+
+    if (!row) {
+      const matched = matchStudentToExcelRow({ studentId, fullName: studentName }, students);
+      if (matched) {
+        row = matched.row;
+        studentObj = matched;
+      }
+    }
+
+    if (!row) {
+      throw new Error(`Could not identify student row for correction: '${studentName || studentId || 'Unknown'}'.`);
+    }
 
     const cellRef = `${colName}${row}`;
     const rowRegex = new RegExp(`(<row\\b[^>]*r="${row}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
@@ -1604,19 +1725,85 @@ export async function correctAttendanceEntryInMaster(params: {
     sheetXml = sheetXml.replace(rowRegex, `${rowMatch[1]}${rowContent}${rowMatch[3]}`);
 
     fs.writeFileSync(sheet1Path, sheetXml, 'utf8');
-    await rebuildMasterXlsx();
+    await rebuildMasterXlsx(idToken);
 
-    const students = parseStudents(sheetXml, sharedStrings);
-    const studentObj = students.find((s) => s.row === row);
     const meta = await syncLatestMeta();
 
     return {
       success: true,
-      studentName: studentObj?.name || `Row ${row}`,
+      studentName: studentObj?.name || studentName || `Row ${row}`,
       row,
       cellRef,
       version: meta.version,
     };
+  });
+}
+
+/**
+ * Public: Synchronize pending / un-synced attendance records into Master Excel
+ */
+export async function syncPendingRecordsInMaster(
+  records: AttendanceRecord[],
+  idToken?: string | null
+): Promise<{ updatedCount: number; version: number }> {
+  if (!records || records.length === 0) {
+    const meta = await syncLatestMeta();
+    return { updatedCount: 0, version: meta.version };
+  }
+
+  return withMasterLock(async () => {
+    await syncFromStorage();
+    const sheet1Path = path.join(TMP_UNPACKED_DIR, 'xl', 'worksheets', 'sheet1.xml');
+    let sheetXml = fs.readFileSync(sheet1Path, 'utf8');
+    const sharedStrings = loadSharedStrings();
+
+    let dateInfo = parseDateColumns(sheetXml);
+    const students = parseStudents(sheetXml, sharedStrings);
+    let updatedCount = 0;
+
+    for (const rec of records) {
+      if (!rec.classDate || !rec.classDate.match(/^\d{4}-\d{2}-\d{2}$/)) continue;
+      const matched = matchStudentToExcelRow(
+        { studentId: rec.studentId, fullName: rec.studentName, email: rec.studentEmail },
+        students
+      );
+      if (!matched) continue;
+
+      const { updatedSheetXml, colName } = ensureDateColumn(sheetXml, rec.classDate, dateInfo);
+      sheetXml = updatedSheetXml;
+      dateInfo = parseDateColumns(sheetXml);
+
+      const cellRef = `${colName}${matched.row}`;
+      const st = rec.status;
+      const stringId =
+        st === 'PRESENT' || (st as any) === 'P'
+          ? SHARED_STRING_PRESENT
+          : st === 'ABSENT' || (st as any) === 'A'
+          ? SHARED_STRING_ABSENT
+          : SHARED_STRING_LEAVE;
+
+      const rowRegex = new RegExp(`(<row\\b[^>]*r="${matched.row}"[^>]*>)([\\s\\S]*?)(<\\/row>)`);
+      const rowMatch = sheetXml.match(rowRegex);
+      if (!rowMatch) continue;
+
+      let rowContent = rowMatch[2];
+      const newCellXml = `<c r="${cellRef}" s="20" t="s"><v>${stringId}</v></c>`;
+      rowContent = setCellInRow(rowContent, cellRef, colName, newCellXml);
+
+      const allDateCols = Object.keys(dateInfo.colDateMap);
+      rowContent = recalculateStudentRow(rowContent, matched.row, allDateCols, sharedStrings);
+
+      sheetXml = sheetXml.replace(rowRegex, `${rowMatch[1]}${rowContent}${rowMatch[3]}`);
+      updatedCount++;
+    }
+
+    if (updatedCount > 0) {
+      fs.writeFileSync(sheet1Path, sheetXml, 'utf8');
+      await rebuildMasterXlsx(idToken);
+    }
+
+    const meta = await syncLatestMeta();
+    return { updatedCount, version: meta.version };
   });
 }
 
@@ -1648,7 +1835,7 @@ export function getMasterWorkbookFilePath(): string {
  * Downloads the latest version from persistent storage.
  */
 export async function getMasterWorkbookBufferForDownload(): Promise<{ buffer: Buffer; filename: string }> {
-  return lock.acquire('master-workbook', async () => {
+  return withMasterLock(async () => {
     await ensureMasterWorkbook();
     const buffer = await downloadLatestMasterWorkbook();
     const meta = await syncLatestMeta();
