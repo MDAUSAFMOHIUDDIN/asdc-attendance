@@ -9,7 +9,7 @@ export async function POST(request: NextRequest) {
 
     if (!adminEmail || !isAuthorizedAdmin(adminEmail)) {
       return NextResponse.json(
-        { error: 'Unauthorized: Only administrator (mdausafmohiuddin@gmail.com) can manage classroom QR.' },
+        { error: 'Unauthorized: Only authorized institute administrators can manage classroom QR.' },
         { status: 403 }
       );
     }

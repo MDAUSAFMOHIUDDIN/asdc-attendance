@@ -1,9 +1,10 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { finalizeDailyAttendanceInMaster } from '@/lib/excel-master-service';
-import { isAuthorizedAdmin, INSTITUTE_CONFIG } from '@/lib/admin-config';
+import { INSTITUTE_CONFIG } from '@/lib/admin-config';
 import { db, FIREBASE_CONFIG } from '@/lib/firebase';
 import { doc, setDoc, getDocs, collection, query, where } from 'firebase/firestore';
 import { AuditLog, AttendanceRecord, StudentProfile, FinalizedDateRecord } from '@/lib/types';
+import { verifyAdminToken } from '@/lib/firebase-admin';
 
 export const dynamic = 'force-dynamic';
 
@@ -12,15 +13,25 @@ export async function POST(request: NextRequest) {
     const authHeader = request.headers.get('Authorization') || request.headers.get('authorization');
     const idToken = authHeader?.startsWith('Bearer ') ? authHeader.slice(7).trim() : null;
 
-    const body = await request.json();
-    const { adminEmail, date, attendanceRecords } = body;
-
-    if (!isAuthorizedAdmin(adminEmail)) {
+    if (!idToken) {
       return NextResponse.json(
-        { error: 'Unauthorized: Only authorized admin (mdausafmohiuddin@gmail.com) may finalize attendance.' },
+        { error: 'Missing administrator authentication token. You must be signed in as an administrator.' },
+        { status: 401 }
+      );
+    }
+
+    // 1. Verify the actual administrator's Firebase ID token on the trusted backend
+    const adminAuth = await verifyAdminToken(idToken);
+    if (!adminAuth.authorized || !adminAuth.email) {
+      return NextResponse.json(
+        { error: adminAuth.error || 'Unauthorized: Only authorized institute administrators can finalize attendance.' },
         { status: 403 }
       );
     }
+
+    const adminEmail = adminAuth.email;
+    const body = await request.json().catch(() => ({}));
+    const { date, attendanceRecords } = body;
 
     if (!date || !date.match(/^\d{4}-\d{2}-\d{2}$/)) {
       return NextResponse.json(
@@ -31,48 +42,46 @@ export async function POST(request: NextRequest) {
 
     const nowIso = new Date().toISOString();
 
-    // 1. Fetch all registered students
+    // 2. Retrieve authoritative registered students from Firestore
     const allStudents: StudentProfile[] = [];
-    if (idToken) {
-      try {
-        const restStudentsUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/students?pageSize=500`;
-        const restRes = await fetch(restStudentsUrl, {
-          headers: { Authorization: `Bearer ${idToken}` },
-        });
-        if (restRes.ok) {
-          const sData = await restRes.json();
-          const docs = sData.documents || [];
-          for (const d of docs) {
-            const f = d.fields || {};
-            const uid = f.uid?.stringValue || d.name?.split('/').pop() || '';
-            const studentId = f.studentId?.stringValue || '';
-            const fullName = f.fullName?.stringValue || '';
-            const email = f.email?.stringValue || '';
-            const phoneNumber = f.phoneNumber?.stringValue || '';
-            const fatherName = f.fatherName?.stringValue || '';
-            const motherName = f.motherName?.stringValue || '';
-            const batchId = f.batchId?.stringValue || INSTITUTE_CONFIG.DEFAULT_BATCH_ID;
-            const batchName = f.batchName?.stringValue || INSTITUTE_CONFIG.DEFAULT_BATCH_NAME;
-            if (uid && studentId && fullName) {
-              allStudents.push({
-                uid,
-                studentId,
-                fullName,
-                email,
-                phoneNumber,
-                fatherName,
-                motherName,
-                batchId,
-                batchName,
-                createdAt: f.createdAt?.stringValue || nowIso,
-                updatedAt: f.updatedAt?.stringValue || nowIso,
-              });
-            }
+    try {
+      const restStudentsUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/students?pageSize=500`;
+      const restRes = await fetch(restStudentsUrl, {
+        headers: { Authorization: `Bearer ${idToken}` },
+      });
+      if (restRes.ok) {
+        const sData = await restRes.json();
+        const docs = sData.documents || [];
+        for (const d of docs) {
+          const f = d.fields || {};
+          const uid = f.uid?.stringValue || d.name?.split('/').pop() || '';
+          const studentId = f.studentId?.stringValue || '';
+          const fullName = f.fullName?.stringValue || '';
+          const email = f.email?.stringValue || '';
+          const phoneNumber = f.phoneNumber?.stringValue || '';
+          const fatherName = f.fatherName?.stringValue || '';
+          const motherName = f.motherName?.stringValue || '';
+          const batchId = f.batchId?.stringValue || INSTITUTE_CONFIG.DEFAULT_BATCH_ID;
+          const batchName = f.batchName?.stringValue || INSTITUTE_CONFIG.DEFAULT_BATCH_NAME;
+          if (uid && studentId && fullName) {
+            allStudents.push({
+              uid,
+              studentId,
+              fullName,
+              email,
+              phoneNumber,
+              fatherName,
+              motherName,
+              batchId,
+              batchName,
+              createdAt: f.createdAt?.stringValue || nowIso,
+              updatedAt: f.updatedAt?.stringValue || nowIso,
+            });
           }
         }
-      } catch (err) {
-        console.warn('[Finalize API] Students REST fetch notice:', err);
       }
+    } catch (err) {
+      console.warn('[Finalize API] Students REST query notice:', err);
     }
 
     if (allStudents.length === 0) {
@@ -82,11 +91,11 @@ export async function POST(request: NextRequest) {
           allStudents.push(d.data() as StudentProfile);
         });
       } catch (sdkErr) {
-        console.warn('[Finalize API] Students SDK fetch notice:', sdkErr);
+        console.warn('[Finalize API] Students SDK query notice:', sdkErr);
       }
     }
 
-    // 2. Fetch all confirmed attendance records for date
+    // 3. Retrieve authoritative attendance for the selected date
     const existingRecordsMap: Record<string, AttendanceRecord> = {};
     if (Array.isArray(attendanceRecords) && attendanceRecords.length > 0) {
       attendanceRecords.forEach((r: AttendanceRecord) => {
@@ -102,15 +111,17 @@ export async function POST(request: NextRequest) {
         if (rec.studentUid) existingRecordsMap[rec.studentUid] = rec;
       });
     } catch (qErr) {
-      console.warn('[Finalize API] Existing attendance query notice:', qErr);
+      console.warn('[Finalize API] Attendance query notice:', qErr);
     }
 
-    // 3. Process every registered student and commit authoritative status to Firestore
+    // 4. Validate every database update and commit to Firestore
     const allRecordsForDate: AttendanceRecord[] = [];
     let presentCount = 0;
     let absentCount = 0;
     let excusedCount = 0;
     let newlyMarkedAbsentCount = 0;
+    let failedDatabaseWrites = 0;
+    const writeErrors: string[] = [];
 
     for (const student of allStudents) {
       const existing = existingRecordsMap[student.uid];
@@ -140,29 +151,31 @@ export async function POST(request: NextRequest) {
 
         allRecordsForDate.push(updated);
 
-        // Update in Firestore
+        // Commit and validate database write via authenticated REST API
         try {
-          await setDoc(doc(db, 'attendance', docId), updated, { merge: true });
-        } catch {}
-
-        if (idToken) {
-          try {
-            const restUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/attendance/${docId}`;
-            await fetch(restUrl, {
-              method: 'PATCH',
-              headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                fields: {
-                  finalizationStatus: { stringValue: 'FINALIZED' },
-                  excelSyncStatus: { stringValue: 'SYNCED' },
-                  status: { stringValue: finalStatus },
-                },
-              }),
-            });
-          } catch {}
+          const restUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/attendance/${docId}`;
+          const res = await fetch(restUrl, {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              fields: {
+                finalizationStatus: { stringValue: 'FINALIZED' },
+                excelSyncStatus: { stringValue: 'SYNCED' },
+                status: { stringValue: finalStatus },
+              },
+            }),
+          });
+          if (!res.ok) {
+            const errText = await res.text();
+            failedDatabaseWrites++;
+            writeErrors.push(`Failed to update attendance for ${student.studentId}: ${errText}`);
+          }
+        } catch (dbErr: any) {
+          failedDatabaseWrites++;
+          writeErrors.push(`Error writing attendance for ${student.studentId}: ${dbErr?.message}`);
         }
       } else {
-        // No attendance recorded: mark ABSENT only on administrator finalization confirmation
+        // No attendance recorded: Apply 'ABSENT' upon explicit administrator finalization
         absentCount++;
         newlyMarkedAbsentCount++;
 
@@ -188,49 +201,58 @@ export async function POST(request: NextRequest) {
 
         allRecordsForDate.push(absentRecord);
 
-        // Commit to Firestore attendance collection
+        // Commit and validate database write
         try {
-          await setDoc(doc(db, 'attendance', docId), absentRecord);
-        } catch (setErr) {
-          console.warn(`[Finalize API] Could not write absent record via SDK for ${student.studentId}:`, setErr);
-        }
-
-        if (idToken) {
-          try {
-            const restUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/attendance/${docId}`;
-            await fetch(restUrl, {
-              method: 'PATCH',
-              headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
-              body: JSON.stringify({
-                fields: {
-                  id: { stringValue: absentRecord.id },
-                  studentUid: { stringValue: absentRecord.studentUid },
-                  studentId: { stringValue: absentRecord.studentId },
-                  studentName: { stringValue: absentRecord.studentName },
-                  studentEmail: { stringValue: absentRecord.studentEmail },
-                  classDate: { stringValue: absentRecord.classDate },
-                  batchId: { stringValue: absentRecord.batchId },
-                  status: { stringValue: absentRecord.status },
-                  source: { stringValue: absentRecord.source },
-                  verifiedAt: { stringValue: absentRecord.verifiedAt },
-                  submittedAt: { stringValue: absentRecord.submittedAt || nowIso },
-                  timestamp: { stringValue: nowIso },
-                  eventId: { stringValue: absentRecord.eventId || '' },
-                  dbCommitStatus: { stringValue: 'COMMITTED' },
-                  excelSyncStatus: { stringValue: 'SYNCED' },
-                  finalizationStatus: { stringValue: 'FINALIZED' },
-                  correctionReason: { stringValue: absentRecord.correctionReason || '' },
-                },
-              }),
-            });
-          } catch (restErr) {
-            console.warn(`[Finalize API] Could not write absent record via REST for ${student.studentId}:`, restErr);
+          const restUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/attendance/${docId}`;
+          const res = await fetch(restUrl, {
+            method: 'PATCH',
+            headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              fields: {
+                id: { stringValue: absentRecord.id },
+                studentUid: { stringValue: absentRecord.studentUid },
+                studentId: { stringValue: absentRecord.studentId },
+                studentName: { stringValue: absentRecord.studentName },
+                studentEmail: { stringValue: absentRecord.studentEmail },
+                classDate: { stringValue: absentRecord.classDate },
+                batchId: { stringValue: absentRecord.batchId },
+                status: { stringValue: absentRecord.status },
+                source: { stringValue: absentRecord.source },
+                verifiedAt: { stringValue: absentRecord.verifiedAt },
+                submittedAt: { stringValue: absentRecord.submittedAt || nowIso },
+                timestamp: { stringValue: nowIso },
+                eventId: { stringValue: absentRecord.eventId || '' },
+                dbCommitStatus: { stringValue: 'COMMITTED' },
+                excelSyncStatus: { stringValue: 'SYNCED' },
+                finalizationStatus: { stringValue: 'FINALIZED' },
+                correctionReason: { stringValue: absentRecord.correctionReason || '' },
+              },
+            }),
+          });
+          if (!res.ok) {
+            const errText = await res.text();
+            failedDatabaseWrites++;
+            writeErrors.push(`Failed to commit absent record for ${student.studentId}: ${errText}`);
           }
+        } catch (dbErr: any) {
+          failedDatabaseWrites++;
+          writeErrors.push(`Error committing absent record for ${student.studentId}: ${dbErr?.message}`);
         }
       }
     }
 
-    // 4. Record Finalized Date in Firestore finalized_dates collection
+    // Never mark an operation successful when a database write failed
+    if (failedDatabaseWrites > 0) {
+      return NextResponse.json(
+        {
+          error: `Finalization failed: ${failedDatabaseWrites} database write(s) could not be committed.`,
+          details: writeErrors,
+        },
+        { status: 500 }
+      );
+    }
+
+    // 5. Finalize only the selected date in Firestore finalized_dates
     const finalizationDoc: FinalizedDateRecord = {
       id: date,
       date,
@@ -244,85 +266,71 @@ export async function POST(request: NextRequest) {
     };
 
     try {
-      await setDoc(doc(db, 'finalized_dates', date), finalizationDoc);
+      const restUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/finalized_dates/${date}`;
+      await fetch(restUrl, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fields: {
+            id: { stringValue: finalizationDoc.id },
+            date: { stringValue: finalizationDoc.date },
+            finalizedAt: { stringValue: finalizationDoc.finalizedAt },
+            finalizedBy: { stringValue: finalizationDoc.finalizedBy },
+            presentCount: { integerValue: String(presentCount) },
+            absentCount: { integerValue: String(absentCount) },
+            excusedCount: { integerValue: String(excusedCount) },
+            totalStudents: { integerValue: String(allStudents.length) },
+            status: { stringValue: 'FINALIZED' },
+          },
+        }),
+      });
     } catch (fErr) {
-      console.warn('[Finalize API] finalized_dates write note:', fErr);
+      console.warn('[Finalize API] finalized_dates write notice:', fErr);
     }
 
-    if (idToken) {
-      try {
-        const restUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/finalized_dates/${date}`;
-        await fetch(restUrl, {
-          method: 'PATCH',
-          headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            fields: {
-              id: { stringValue: finalizationDoc.id },
-              date: { stringValue: finalizationDoc.date },
-              finalizedAt: { stringValue: finalizationDoc.finalizedAt },
-              finalizedBy: { stringValue: finalizationDoc.finalizedBy },
-              presentCount: { integerValue: String(presentCount) },
-              absentCount: { integerValue: String(absentCount) },
-              excusedCount: { integerValue: String(excusedCount) },
-              totalStudents: { integerValue: String(allStudents.length) },
-              status: { stringValue: 'FINALIZED' },
-            },
-          }),
-        });
-      } catch (fRestErr) {
-        console.warn('[Finalize API] finalized_dates REST note:', fRestErr);
-      }
-    }
-
-    // 5. Finalize and synchronize in Canonical Master Excel Workbook
+    // 6. Synchronize corresponding Excel date column and verify uploaded workbook
     const excelResult = await finalizeDailyAttendanceInMaster(date, adminEmail, allRecordsForDate, idToken);
 
-    // 6. Record Audit Log in Firestore
+    // 7. Record minimal audit log
     try {
       const logId = `finalize_${Date.now()}_${date}`;
       const auditLog: AuditLog = {
         id: logId,
         adminEmail,
         action: 'FINALIZE_DAILY_ATTENDANCE',
-        targetStudentId: 'BATCH_19_ALL',
-        targetStudentName: 'Batch 19 Students',
+        targetStudentId: 'BATCH_ALL',
+        targetStudentName: 'All Registered Students',
         targetDate: date,
         newStatus: 'FINALIZED',
-        reason: `Finalized daily attendance for ${date}. Confirmed ${presentCount} Present, ${absentCount} Absent (${newlyMarkedAbsentCount} newly marked), ${excusedCount} Excused across all ${allStudents.length} registered students in authoritative DB & Master Excel.`,
+        reason: `Finalized date ${date}: ${presentCount} Present, ${absentCount} Absent (${newlyMarkedAbsentCount} unrecorded marked absent), ${excusedCount} Excused across ${allStudents.length} students.`,
         timestamp: nowIso,
       };
 
-      await setDoc(doc(db, 'audit_logs', logId), auditLog);
-
-      if (idToken) {
-        try {
-          const restUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/audit_logs/${logId}`;
-          await fetch(restUrl, {
-            method: 'PATCH',
-            headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              fields: {
-                id: { stringValue: auditLog.id },
-                adminEmail: { stringValue: auditLog.adminEmail },
-                action: { stringValue: auditLog.action },
-                targetStudentId: { stringValue: auditLog.targetStudentId },
-                targetStudentName: { stringValue: auditLog.targetStudentName },
-                targetDate: { stringValue: auditLog.targetDate },
-                newStatus: { stringValue: auditLog.newStatus },
-                reason: { stringValue: auditLog.reason },
-                timestamp: { stringValue: auditLog.timestamp },
-              },
-            }),
-          });
-        } catch {}
-      }
+      const restUrl = `https://firestore.googleapis.com/v1/projects/${FIREBASE_CONFIG.projectId}/databases/(default)/documents/audit_logs/${logId}`;
+      await fetch(restUrl, {
+        method: 'PATCH',
+        headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          fields: {
+            id: { stringValue: auditLog.id },
+            adminEmail: { stringValue: auditLog.adminEmail },
+            action: { stringValue: auditLog.action },
+            targetStudentId: { stringValue: auditLog.targetStudentId },
+            targetStudentName: { stringValue: auditLog.targetStudentName },
+            targetDate: { stringValue: auditLog.targetDate },
+            newStatus: { stringValue: auditLog.newStatus },
+            reason: { stringValue: auditLog.reason },
+            timestamp: { stringValue: auditLog.timestamp },
+          },
+        }),
+      });
     } catch (auditErr) {
       console.warn('[Finalize API] Audit log write note:', auditErr);
     }
 
     return NextResponse.json({
       success: true,
-      message: `Successfully finalized attendance for ${date}. Authoritative records updated: ${presentCount} Present, ${absentCount} Absent in database and Master Excel workbook.`,
+      message: `Successfully finalized attendance for ${date}. Authoritative records confirmed: ${presentCount} Present, ${absentCount} Absent in database and Master Excel workbook.`,
       result: {
         date,
         presentCount,

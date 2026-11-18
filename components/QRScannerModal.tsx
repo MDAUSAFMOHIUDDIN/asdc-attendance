@@ -429,10 +429,18 @@ export function QRScannerModal({
         let idToken: string | null = null;
         try {
           if (auth.currentUser) {
-            idToken = await auth.currentUser.getIdToken();
+            idToken = await auth.currentUser.getIdToken(true);
           }
-        } catch {
-          // Token acquisition fallback
+        } catch (tokenErr) {
+          console.warn('[ASDC Scanner] Token acquisition error:', tokenErr);
+        }
+
+        if (!idToken) {
+          stopCameraResources();
+          setErrorMessage('You must be signed in with a valid student account to submit attendance. Please re-login.');
+          setErrorType('GENERIC');
+          setScannerState('error');
+          return;
         }
 
         const res = await fetch('/api/attendance/submit', {

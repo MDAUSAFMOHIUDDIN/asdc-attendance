@@ -2,22 +2,26 @@
  * ASDC Attendance - Institute Administration Configuration
  * 
  * ==============================================================================
- * SOLE AUTHORIZED ADMINISTRATOR
- * Only this exact Google account may access the Admin Dashboard and all
- * administrative controls (attendance corrections, student records, QR generator).
+ * AUTHORIZED ADMINISTRATORS
+ * Both Google accounts have full administrative access:
+ * 1. mdausafmohiuddin@gmail.com
+ * 2. jaferbhelmig@gmail.com
  * ==============================================================================
  */
 
-export const SOLE_ADMIN_EMAIL = 'mdausafmohiuddin@gmail.com';
-export const ADMIN_EMAIL_1 = SOLE_ADMIN_EMAIL;
+export const ADMIN_EMAIL_1 = 'mdausafmohiuddin@gmail.com';
+export const ADMIN_EMAIL_2 = 'jaferbhelmig@gmail.com';
+export const SOLE_ADMIN_EMAIL = ADMIN_EMAIL_1; // For backwards compatibility
 
 export const ALLOWED_ADMIN_EMAILS: readonly string[] = [
-  SOLE_ADMIN_EMAIL.toLowerCase().trim(),
+  ADMIN_EMAIL_1.toLowerCase().trim(),
+  ADMIN_EMAIL_2.toLowerCase().trim(),
 ];
 
 export function isAuthorizedAdmin(email: string | null | undefined): boolean {
   if (!email) return false;
-  return email.toLowerCase().trim() === SOLE_ADMIN_EMAIL.toLowerCase().trim();
+  const normalized = email.toLowerCase().trim();
+  return ALLOWED_ADMIN_EMAILS.includes(normalized);
 }
 
 /**

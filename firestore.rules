@@ -16,10 +16,11 @@ service cloud.firestore {
       return isSignedIn() && request.auth.token.email_verified == true;
     }
 
-    // Strict Sole Admin Enforcement: ONLY mdausafmohiuddin@gmail.com
+    // Authorized Institute Administrators: mdausafmohiuddin@gmail.com AND jaferbhelmig@gmail.com
     function isAdmin() {
       return isSignedIn() && (
-        request.auth.token.email.lower() == 'mdausafmohiuddin@gmail.com'
+        request.auth.token.email.lower() == 'mdausafmohiuddin@gmail.com' ||
+        request.auth.token.email.lower() == 'jaferbhelmig@gmail.com'
       );
     }
 
@@ -93,7 +94,7 @@ service cloud.firestore {
     match /students/{studentUid} {
       allow get: if isSignedIn() && (request.auth.uid == studentUid || isAdmin());
       allow list: if isAdmin();
-      allow create: if isSignedIn() && isValidId(studentUid) && request.auth.uid == studentUid && isValidStudent(incoming());
+      allow create: if isSignedIn() && isValidId(studentUid) && ((request.auth.uid == studentUid && isValidStudent(incoming())) || isAdmin());
       allow update: if isSignedIn() && isValidId(studentUid) && (
         isAdmin() ||
         (
@@ -171,6 +172,12 @@ service cloud.firestore {
       allow get: if isSignedIn() && isValidId(settingId);
       allow list: if isSignedIn();
       allow create, update, delete: if isAdmin() && isValidId(settingId);
+    }
+
+    // Excel Synchronization Jobs
+    match /excel_sync_jobs/{jobId} {
+      allow get, list: if isSignedIn();
+      allow create, update, delete: if isSignedIn() && isValidId(jobId);
     }
 
     // Finalized Dates (Admin can write, signed-in users can read)

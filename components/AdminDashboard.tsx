@@ -31,6 +31,7 @@ import {
   Navigation,
   Crosshair,
   Radio,
+  UserPlus,
 } from 'lucide-react';
 import {
   getAllStudents,
@@ -88,11 +89,14 @@ import {
 } from '@/lib/date-utils';
 import {
   SOLE_ADMIN_EMAIL,
+  ALLOWED_ADMIN_EMAILS,
   INSTITUTE_CONFIG,
 } from '@/lib/admin-config';
 import { generateClassroomQRDataUrl } from '@/lib/qr-generator';
 import { NotificationPanel } from './NotificationPanel';
 import { NotificationComposerModal } from './NotificationComposerModal';
+import { AdmitStudentModal } from './AdmitStudentModal';
+import { DeleteStudentModal } from './DeleteStudentModal';
 import { subscribeToNotifications } from '@/lib/push-notification-service';
 
 interface AdminDashboardProps {
@@ -109,6 +113,28 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
   const [announcements, setAnnouncements] = useState<Announcement[]>([]);
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([]);
   const [loading, setLoading] = useState(true);
+
+  // Student Management State (Admit & Permanent Removal)
+  const [admitModalOpen, setAdmitModalOpen] = useState(false);
+  const [deleteModalStudent, setDeleteModalStudent] = useState<StudentProfile | null>(null);
+
+  const handleStudentAdmitted = (newStudent: StudentProfile) => {
+    setStudents((prev) => {
+      const exists = prev.some((s) => s.uid === newStudent.uid || s.studentId === newStudent.studentId);
+      if (exists) return prev;
+      return [...prev, newStudent];
+    });
+  };
+
+  const handleStudentDeleted = (deletedUid: string, deletedId: string) => {
+    setStudents((prev) => prev.filter((s) => s.uid !== deletedUid && s.studentId !== deletedId));
+    setDailyAttendance((prev) => {
+      const next = { ...prev };
+      delete next[deletedUid];
+      return next;
+    });
+    setStudentDetailRecords((prev) => prev.filter((r) => r.studentUid !== deletedUid && r.studentId !== deletedId));
+  };
 
   // Master Excel Canonical Workbook State
   const [masterInfo, setMasterInfo] = useState<MasterWorkbookInfo | null>(null);
@@ -1419,27 +1445,37 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                   />
                 </div>
 
-                <div className="flex items-center gap-1 text-xs">
-                  <span className="text-slate-600 font-bold text-[11px] mr-1 hidden sm:inline">Status:</span>
-                  {(['ALL', 'PRESENT', 'ABSENT', 'NOT_RECORDED'] as const).map((s) => (
-                    <button
-                      key={s}
-                      onClick={() => setStatusFilter(s)}
-                      className={`px-3 py-1 rounded-md text-[11px] font-bold transition ${
-                        statusFilter === s
-                          ? 'bg-blue-600 text-white shadow-sm'
-                          : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
-                      }`}
-                    >
-                      {s === 'ALL'
-                        ? 'All'
-                        : s === 'PRESENT'
-                        ? 'Present'
-                        : s === 'ABSENT'
-                        ? 'Absent'
-                        : 'Pending'}
-                    </button>
-                  ))}
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="flex items-center gap-1 text-xs">
+                    <span className="text-slate-600 font-bold text-[11px] mr-1 hidden sm:inline">Status:</span>
+                    {(['ALL', 'PRESENT', 'ABSENT', 'NOT_RECORDED'] as const).map((s) => (
+                      <button
+                        key={s}
+                        onClick={() => setStatusFilter(s)}
+                        className={`px-3 py-1 rounded-md text-[11px] font-bold transition ${
+                          statusFilter === s
+                            ? 'bg-blue-600 text-white shadow-sm'
+                            : 'bg-white border border-slate-200 text-slate-700 hover:bg-slate-100'
+                        }`}
+                      >
+                        {s === 'ALL'
+                          ? 'All'
+                          : s === 'PRESENT'
+                          ? 'Present'
+                          : s === 'ABSENT'
+                          ? 'Absent'
+                          : 'Pending'}
+                      </button>
+                    ))}
+                  </div>
+
+                  <button
+                    onClick={() => setAdmitModalOpen(true)}
+                    className="px-3.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold flex items-center gap-1.5 shadow-sm transition whitespace-nowrap"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" />
+                    <span>Admit New Student</span>
+                  </button>
                 </div>
               </div>
 
@@ -1555,6 +1591,13 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                                   title="Correct / Override Attendance"
                                 >
                                   <Edit className="w-3 h-3" />
+                                </button>
+                                <button
+                                  onClick={() => setDeleteModalStudent(stu)}
+                                  className="px-2 py-1 bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 rounded text-xs font-bold transition"
+                                  title="Permanently Remove Student"
+                                >
+                                  <Trash2 className="w-3 h-3" />
                                 </button>
                               </div>
                             </td>
@@ -2064,8 +2107,8 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
                       ASDC_PERMANENT_CLASSROOM_QR
                     </p>
                     <p className="text-[11px] text-slate-400">
-                      Institute: <strong className="text-slate-200">{INSTITUTE_CONFIG.INSTITUTE_NAME}</strong> • Authorized Admin:{' '}
-                      <strong className="text-slate-200">{SOLE_ADMIN_EMAIL}</strong>
+                      Institute: <strong className="text-slate-200">{INSTITUTE_CONFIG.INSTITUTE_NAME}</strong> • Authorized Admins:{' '}
+                      <strong className="text-slate-200">{ALLOWED_ADMIN_EMAILS.join(', ')}</strong>
                     </p>
                   </div>
 
@@ -2898,24 +2941,28 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
         {/* ===================== TAB 6: SETTINGS & PILOT TESTING ===================== */}
         {activeTab === 'settings' && (
           <div className="space-y-6 max-w-4xl mx-auto">
-            {/* Sole Admin Configuration Info Box */}
+            {/* Authorized Admin Configuration Info Box */}
             <div className="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm">
               <h3 className="text-base font-bold text-slate-950 mb-2 flex items-center gap-2">
                 <Shield className="w-5 h-5 text-blue-600" />
-                Sole Authorized Admin Account
+                Authorized Admin Accounts
               </h3>
               <p className="text-xs text-slate-600 mb-4 leading-relaxed font-medium">
-                Administrative access is strictly restricted to ONE exact Google account: <strong>{SOLE_ADMIN_EMAIL}</strong>. This restriction is enforced in frontend routing and Firestore Security Rules.
+                Administrative access is strictly restricted to the authorized Google accounts: <strong>{ALLOWED_ADMIN_EMAILS.join(', ')}</strong>. This restriction is enforced across backend API routes, Identity Toolkit verification, and Firestore Security Rules.
               </p>
 
               <div className="p-4 bg-blue-50/60 border border-blue-200 rounded-xl text-xs font-mono">
                 <span className="text-[10px] text-blue-900 uppercase block font-sans font-bold">
-                  Sole Authorized Administrator (mdausafmohiuddin@gmail.com)
+                  Authorized Administrators
                 </span>
-                <span className="text-blue-900 font-black text-sm block mt-1">
-                  {SOLE_ADMIN_EMAIL}
-                </span>
-                <span className="text-[11px] text-slate-600 font-sans block mt-1 font-medium">
+                <div className="mt-1 space-y-1">
+                  {ALLOWED_ADMIN_EMAILS.map((email) => (
+                    <span key={email} className="text-blue-900 font-black text-sm block">
+                      • {email}
+                    </span>
+                  ))}
+                </div>
+                <span className="text-[11px] text-slate-600 font-sans block mt-2 font-medium">
                   Configured in <code className="text-blue-800 font-bold">/lib/admin-config.ts</code> &amp; <code className="text-blue-800 font-bold">firestore.rules</code>
                 </span>
               </div>
@@ -3352,12 +3399,27 @@ export function AdminDashboard({ adminEmail, onLogout }: AdminDashboardProps) {
         />
       )}
 
-      {/* Subtle Developer Credits Footer */}
-      <footer className="mt-auto pt-10 pb-6 border-t border-slate-200 text-center text-xs text-slate-500 bg-white">
+      {/* Student Admission Modal */}
+      <AdmitStudentModal
+        isOpen={admitModalOpen}
+        onClose={() => setAdmitModalOpen(false)}
+        onStudentAdmitted={handleStudentAdmitted}
+      />
+
+      {/* Student Permanent Removal Modal */}
+      <DeleteStudentModal
+        student={deleteModalStudent}
+        isOpen={Boolean(deleteModalStudent)}
+        onClose={() => setDeleteModalStudent(null)}
+        onStudentDeleted={handleStudentDeleted}
+      />
+
+      {/* Developer Credits Footer */}
+      <footer className="mt-auto pt-10 pb-6 border-t border-slate-200 text-center text-xs text-slate-600 bg-white">
         <p>© {new Date().getFullYear()} {INSTITUTE_CONFIG.INSTITUTE_FULL_NAME}. All rights reserved.</p>
-        <p className="mt-1.5 text-[11px] text-slate-400">
-          Developed by <span className="font-semibold text-slate-600">MD AUSAF MOHIUDDIN</span> | Contact:{' '}
-          <a href="tel:9618890557" className="text-blue-600 hover:underline font-mono">9618890557</a>
+        <p className="mt-1.5 text-xs text-slate-600 font-medium">
+          Developed by <strong className="font-bold text-slate-900">MD AUSAF MOHIUDDIN</strong> | Contact:{' '}
+          <a href="tel:9618890557" className="text-blue-600 hover:text-blue-800 font-bold hover:underline font-mono">9618890557</a>
         </p>
       </footer>
     </div>

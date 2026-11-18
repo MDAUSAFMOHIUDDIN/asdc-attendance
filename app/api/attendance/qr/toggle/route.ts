@@ -10,7 +10,7 @@ export async function POST(request: NextRequest) {
 
     if (!adminEmail || !isAuthorizedAdmin(adminEmail)) {
       return NextResponse.json(
-        { error: 'Unauthorized: Only authorized administrator (mdausafmohiuddin@gmail.com) can control QR access.' },
+        { error: 'Unauthorized: Only authorized institute administrators can control QR access.' },
         { status: 403 }
       );
     }

@@ -139,7 +139,7 @@ export async function setQRAccessStatus(
   newStatusOrEnabled: QRAccessStatus | boolean
 ): Promise<{ success: boolean; status: QRAccessStatus; qrAccessEnabled: boolean; updatedAt: string }> {
   if (!isAuthorizedAdmin(adminEmail)) {
-    throw new Error('Unauthorized: Only authorized administrator (mdausafmohiuddin@gmail.com) can change QR access.');
+    throw new Error('Unauthorized: Only authorized institute administrators can change QR access.');
   }
 
   const isEnabled = typeof newStatusOrEnabled === 'boolean' ? newStatusOrEnabled : newStatusOrEnabled === 'ENABLED';

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { SOLE_ADMIN_EMAIL } from '@/lib/admin-config';
+import { isAuthorizedAdmin, ALLOWED_ADMIN_EMAILS } from '@/lib/admin-config';
 import { FIREBASE_CONFIG } from '@/lib/firebase';
 import * as webPush from 'web-push';
 import { VAPID_PUBLIC_KEY, VAPID_PRIVATE_KEY, VAPID_SUBJECT } from '@/lib/push-config';
@@ -50,13 +50,12 @@ async function verifyAdminIdToken(idToken: string): Promise<{ authorized: boolea
     }
 
     const normalizedEmail = user.email.toLowerCase().trim();
-    const authorizedEmail = SOLE_ADMIN_EMAIL.toLowerCase().trim();
 
-    if (normalizedEmail !== authorizedEmail) {
+    if (!isAuthorizedAdmin(normalizedEmail)) {
       return {
         authorized: false,
         email: normalizedEmail,
-        error: `Unauthorized: Only ${SOLE_ADMIN_EMAIL} can send broadcast push notifications.`,
+        error: `Unauthorized: Account ${normalizedEmail} is not authorized to send broadcast notifications.`,
       };
     }
 
@@ -264,7 +263,7 @@ export async function POST(request: NextRequest) {
     const authResult = await verifyAdminIdToken(idToken);
     if (!authResult.authorized) {
       return NextResponse.json(
-        { error: authResult.error || `Unauthorized: Only ${SOLE_ADMIN_EMAIL} can broadcast notifications.` },
+        { error: authResult.error || 'Unauthorized: Only authorized institute administrators can broadcast notifications.' },
         { status: 403 }
       );
     }
@@ -308,7 +307,7 @@ export async function POST(request: NextRequest) {
       recipientUid,
       recipientName,
       createdAt: new Date().toISOString(),
-      createdBy: SOLE_ADMIN_EMAIL.toLowerCase().trim(),
+      createdBy: (authResult.email || 'admin').toLowerCase().trim(),
       readBy: [],
       url: url || '/',
     };

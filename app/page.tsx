@@ -14,7 +14,7 @@ import {
   Lock,
   LogOut,
 } from 'lucide-react';
-import { INSTITUTE_CONFIG, SOLE_ADMIN_EMAIL } from '@/lib/admin-config';
+import { INSTITUTE_CONFIG, SOLE_ADMIN_EMAIL, ALLOWED_ADMIN_EMAILS } from '@/lib/admin-config';
 import { checkAttendanceWindow, getISTTimeInfo } from '@/lib/date-utils';
 
 function MainAppContent() {
@@ -55,6 +55,16 @@ function MainAppContent() {
       setPortalMode('admin');
     }
   }, [user, isAdmin, portalMode]);
+
+  const handleLogout = async () => {
+    try {
+      await logout();
+      setPortalMode('landing');
+      setAuthError(null);
+    } catch (err) {
+      console.error('Logout error:', err);
+    }
+  };
 
   const handleStudentLogin = async () => {
     setAuthError(null);
@@ -104,7 +114,7 @@ function MainAppContent() {
     // ADMIN PORTAL MODE
     if (portalMode === 'admin') {
       if (isAdmin) {
-        return <AdminDashboard adminEmail={user.email || ''} onLogout={logout} />;
+        return <AdminDashboard adminEmail={user.email || ''} onLogout={handleLogout} />;
       } else {
         // Logged in user is NOT the authorized sole admin
         return (
@@ -127,9 +137,13 @@ function MainAppContent() {
                 </div>
                 <div className="pt-1 border-t border-slate-200">
                   <div className="text-slate-500 text-[10px] uppercase font-sans font-bold">
-                    Sole Authorized Admin
+                    Authorized Admins
                   </div>
-                  <div className="text-blue-700 font-semibold">{SOLE_ADMIN_EMAIL}</div>
+                  <div className="text-blue-700 font-semibold space-y-0.5">
+                    {ALLOWED_ADMIN_EMAILS.map((email) => (
+                      <div key={email}>{email}</div>
+                    ))}
+                  </div>
                 </div>
               </div>
 
@@ -141,7 +155,7 @@ function MainAppContent() {
                   Continue to Student Portal
                 </button>
                 <button
-                  onClick={logout}
+                  onClick={handleLogout}
                   className="w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 rounded-xl text-xs font-semibold transition flex items-center justify-center gap-1.5 border border-slate-200"
                 >
                   <LogOut className="w-3.5 h-3.5" />
@@ -172,7 +186,7 @@ function MainAppContent() {
       return (
         <StudentDashboard
           student={student}
-          onLogout={logout}
+          onLogout={handleLogout}
           onMarkAnnouncementRead={markAnnouncementAsRead}
         />
       );
@@ -323,11 +337,11 @@ function MainAppContent() {
       </div>
 
       {/* Footer */}
-      <footer className="py-6 border-t border-slate-200 bg-white text-center text-xs text-slate-500">
+      <footer className="py-6 border-t border-slate-200 bg-white text-center text-xs text-slate-600">
         <p>© {new Date().getFullYear()} {INSTITUTE_CONFIG.INSTITUTE_FULL_NAME}. All rights reserved.</p>
-        <p className="mt-1.5 text-[11px] text-slate-400">
-          Developed by <span className="font-semibold text-slate-600">MD AUSAF MOHIUDDIN</span> | Contact:{' '}
-          <a href="tel:9618890557" className="text-blue-600 hover:underline font-mono">9618890557</a>
+        <p className="mt-1.5 text-xs text-slate-600 font-medium">
+          Developed by <strong className="font-bold text-slate-900">MD AUSAF MOHIUDDIN</strong> | Contact:{' '}
+          <a href="tel:9618890557" className="text-blue-600 hover:text-blue-800 font-bold hover:underline font-mono">9618890557</a>
         </p>
       </footer>
     </div>

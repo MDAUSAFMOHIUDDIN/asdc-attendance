@@ -354,11 +354,12 @@ export function StudentDashboard({
 
             <button
               onClick={onLogout}
-              className="p-2 rounded-lg text-slate-500 hover:text-rose-600 hover:bg-rose-50 transition"
-              title="Sign Out"
-              aria-label="Sign Out"
+              className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs font-bold transition shadow-sm"
+              title="Log Out of ASDC Attendance"
+              aria-label="Log Out"
             >
-              <LogOut className="w-4 h-4" />
+              <LogOut className="w-3.5 h-3.5" />
+              <span>Logout</span>
             </button>
           </div>
         </div>
@@ -786,12 +787,12 @@ export function StudentDashboard({
         </div>
       )}
 
-      {/* Subtle Developer Credits Footer */}
-      <footer className="mt-auto pt-8 pb-4 border-t border-slate-200 text-center text-xs text-slate-500">
+      {/* Developer Credits Footer */}
+      <footer className="mt-auto pt-8 pb-4 border-t border-slate-200 text-center text-xs text-slate-600">
         <p>© {new Date().getFullYear()} {INSTITUTE_CONFIG.INSTITUTE_FULL_NAME}. All rights reserved.</p>
-        <p className="mt-1.5 text-[11px] text-slate-400">
-          Developed by <span className="font-semibold text-slate-600">MD AUSAF MOHIUDDIN</span> | Contact:{' '}
-          <a href="tel:9618890557" className="text-blue-600 hover:underline font-mono">9618890557</a>
+        <p className="mt-1.5 text-xs text-slate-600 font-medium">
+          Developed by <strong className="font-bold text-slate-900">MD AUSAF MOHIUDDIN</strong> | Contact:{' '}
+          <a href="tel:9618890557" className="text-blue-600 hover:text-blue-800 font-bold hover:underline font-mono">9618890557</a>
         </p>
       </footer>
     </div>

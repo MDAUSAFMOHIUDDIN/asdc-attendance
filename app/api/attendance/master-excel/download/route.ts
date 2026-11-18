@@ -14,7 +14,7 @@ export async function GET(request: NextRequest) {
 
     if (!adminEmail || !isAuthorizedAdmin(adminEmail)) {
       return NextResponse.json(
-        { error: 'Unauthorized: Only administrator (mdausafmohiuddin@gmail.com) can download the master Excel workbook.' },
+        { error: 'Unauthorized: Only authorized institute administrators can download the master Excel workbook.' },
         { status: 403 }
       );
     }
